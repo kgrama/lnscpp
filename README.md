@@ -1,27 +1,173 @@
-# xlnscpp
-XLNSCPP: a C++ package for Logarithmic Number System eXperimentation
+# pbf16
 
-This repository provides `xlns16.cpp` and `xlns32.cpp` along with a few programs that illustrate their use. They are based on similar math foundation (Gaussian logs, sb and db) as the Python xlns repository, but unlike the Python they use different internal storage format.
+**Parameterized Bounded Format — table-free LNS arithmetic for C++**
 
-Unlike the Python xlns, here internal representation is not twos complement; it is offset by a constant (`xlns16_logsignmask` or `xlns32_logsignmask`). With the 16-bit format of `xlns16.cpp`, this is roughly similar to `bfloat16` (1 sign bit, 8 `int(log2)` bits, 7 `frac(log2)` bits). With the 32-bit format of `xlns32.cpp`, this is roughly similar to `float` (1 sign bit, 8 `int(log2)` bits, 23 `frac(log2)` bits). There is an exact representation of 0.0, but no subnormals or NaNs.
+Drop-in replacement for [`xlns16.cpp`](https://github.com/xlnsresearch/xlnscpp) from xlnsresearch.  
+Same types. Same function names. Same operator overloads. No tables.
 
-There are two ways to use this library: function calls (like `xlns16_add` or `xlns32_add`) that operate on integer representations (`typedef` as `xlns_16` or `xlns_32`) that represent the LNS value; or C++ overloaded operators that operate on an LNS class (either `xlns16_float` or `xlns32_float`).  The functions are a bit faster but overloading is easier. 
+*Patent pending GB 2602876.1*
 
-All of the global symbols used begin with either `xlns16` and `xlns32`.  There are several compile-time options indicated by defining macros before including `xlns16.cpp` and `xlns32.cpp` in the main program.  Defining `xlns16_ideal` or `xlns32_ideal` causes the Gaussian Log computation to occur as accurately as possible by doing it in floating point. Omitting this gives a cotransformation/interpolation approximation for 32-bit (at a cost of a few 100K bytes) and a LPVIP approximation for 16-bit (when `xlns16_altopt` is also defined, a less accurate LPVIP algorithm is used).  Defining `xlns16_alt` or `xlns_32alt` uses an addition algorithm that reduces branching (in the sometimes false hope of improved performance on modern architectures).  Omitting this defaults to an equivalent algorithm that runs better on older architectures (like say 8086). Defining `xlns16_table` causes conversion to/from float to occur from tables.  When `xlns16_alt` is also defined, Gaussian Log computation comes from tables.  Both of these improve speed at the cost of less than one megabyte.  The file `xlns16testcase.h` itemizes the meaningful combinations of these options to help automate the regression testing of these options.
+---
 
-The Python and C++ code that begin with `sb` and `db` work together to test whether ideal and LPVIP Gaussian Log computations in `xlns16.cpp` match what the Python xlns library provides.
+## What it is
 
-There is a sister repository, xlnscuda, which has related routines that work on CUDA devices.
+`pbf16.cpp` replaces the Gauss-log lookup tables in xlns16 with fixed-point
+continued fraction evaluation. Addition and subtraction — the hard operations
+in LNS — are computed via CF-based `sb` and `db` functions over pure integer
+arithmetic. No ROM, no SRAM, no `xlns16sbdbtbl.h`, no `xlns16cvtbl.h`.
 
- # References
+The internal 16-bit format is identical to xlns16:
 
-M. G. Arnold, et al. “Arithmetic cotransformations in the Real and
-Complex Logarithmic Number Systems,” _IEEE Trans. Comput._, vol. 47,
-no. 7, pp.777–786, July 1998.
+```
++------+-------------------------+
+| sign | int(log2) . frac(log2) |
++------+-------------------------+
+1 sign bit · 8 integer bits · 7 fractional bits
+Offset by 0x4000 (logsignmask)
+```
 
+---
 
-M. G. Arnold, "LPVIP: A Low-power ROM-Less ALU for Low-Precision LNS," 
-_14th International Workshop on Power and Timing Modeling, Optimization and Simulation_,
-LNCS 3254, pp.675-684, Santorini, Greece, Sept. 2004.
+## Usage
 
+Replace:
+```cpp
+#define xlns16_ideal
+#include "xlns16.cpp"
+```
 
+With:
+```cpp
+#include "pbf16.cpp"
+```
+
+Remove `xlns16cvtbl.h`, `xlns16sbdbtbl.h`, `xlns16logtbl.h`, `xlns16exptbl.h`.  
+`xlns16_ideal`, `xlns16_alt`, `xlns16_table` macros are accepted but have no
+effect — CF is always used.
+
+---
+
+## API
+
+Identical to xlns16. C function interface:
+
+```cpp
+xlns16  fp2xlns16(float x)            // float → LNS
+float   xlns162fp(xlns16 x)           // LNS → float
+
+xlns16  xlns16_add(xlns16 a, xlns16 b)
+xlns16  xlns16_sub(xlns16 a, xlns16 b)
+xlns16  xlns16_mul(xlns16 a, xlns16 b)
+xlns16  xlns16_div(xlns16 a, xlns16 b)
+xlns16  xlns16_neg(xlns16 a)
+xlns16  xlns16_abs(xlns16 a)
+```
+
+C++ class with overloaded operators:
+
+```cpp
+xlns16_float a, b;
+a = 3.0f;
+b = 4.0f;
+xlns16_float c = a * b;   // 12
+xlns16_float d = a + b;   // 7
+std::cout << d;            // 7.0
+```
+
+Batch and vector operations (`xlns16_vec_dot`, `xlns16_batch_mul`, etc.),
+activation functions (`xlns16_relu`, `xlns16_sigmoid`, `xlns16_softmax`, etc.)
+all present and interface-compatible.
+
+---
+
+## Why no tables
+
+LNS addition requires evaluating the Gauss logarithm functions:
+
+- `sb(z) = log₂(1 + 2^z)`  
+- `db(z) = log₂(2^z − 1)`
+
+xlns16 computes these from lookup tables (or floating-point in `xlns16_ideal`
+mode). Table size grows as 2^n — impractical above 10–12 bits, and a liability
+in constrained silicon (no block RAM, side-channel sensitivity, formal
+verification requirements).
+
+pbf16 evaluates sb and db via 8-step continued fractions over Q32 fixed-point
+integers, using `__int128` for intermediate products. The CF converges in
+8 steps with accuracy matching `xlns16_ideal` at 16-bit precision.
+
+Gate-count comparison for the add operation at 16 bits:
+
+| Approach          | Gates (est.) | Latency   | Table? |
+|-------------------|-------------|-----------|--------|
+| ROM table         | ~4,194,000  | 1 cycle   | YES    |
+| CPLA (piecewise)  | ~1,792      | 2 cycles  | NO     |
+| pbf16 CF          | ~34,000     | ~10 cycles| NO     |
+
+ROM is physically impractical at 16 bits. CF trades latency for zero ROM,
+arbitrary precision, and formal verifiability.
+
+---
+
+## SNR vs IEEE 754
+
+Measured on random samples in the safe interior of the dynamic range:
+
+```
+Format    bits    add     sub     mul     div
+──────────────────────────────────────────────
+float16     16   73.3   74.1   73.6   73.7  dB
+pbf16       16   73.3   72.9   69.1   68.8  dB
+```
+
+pbf16 matches float16 on add/sub. mul/div are ~5 dB lower due to two
+input quantizations compounding in log space — a fundamental LNS property,
+not a CF artifact.
+
+---
+
+## Building
+
+Single-file include, no dependencies beyond `<stdint.h>` and `<math.h>`:
+
+```bash
+g++ -O2 your_program.cpp -lm
+```
+
+Requires a C++11 compiler with `__int128` support (gcc, clang on x86-64 and
+ARM64). For MSVC, `__int128` can be emulated — contributions welcome.
+
+---
+
+## Differences from xlns16
+
+| Feature              | xlns16             | pbf16                  |
+|----------------------|--------------------|------------------------|
+| sb / db method       | Table or float     | 8-step CF, Q32 integer |
+| ROM required         | Yes (5–4000 KB)    | None                   |
+| `__int128` required  | No                 | Yes (intermediate ops) |
+| Compile-time options | `ideal/alt/table`  | None (CF always)       |
+| Internal format      | Identical          | Identical              |
+| API                  | Identical          | Identical              |
+
+---
+
+## License
+
+Research and evaluation use only. Commercial use is explicitly prohibited
+without a separate written license from the copyright holder.
+
+Patent pending GB 2602876.1. The continued fraction method for LNS sb/db
+evaluation is the subject of a pending patent application. No patent license
+is granted by the software license.
+
+See [LICENSE](LICENSE) for full terms.
+
+For commercial licensing enquiries, contact the copyright holder.
+
+---
+
+## References
+
+xlnsresearch/xlnscpp: https://github.com/xlnsresearch/xlnscpp  
+xlnsresearch reference list: https://xlnsresearch.github.io
