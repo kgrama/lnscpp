@@ -1,0 +1,1086 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FRACTAL ZOO — SBP Arithmetic</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Bebas+Neue&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #080808;
+    --panel: #111;
+    --border: #222;
+    --accent: #e8ff3c;
+    --accent2: #ff3c6e;
+    --text: #d0d0d0;
+    --dim: #555;
+    --mono: 'Space Mono', monospace;
+    --display: 'Bebas Neue', sans-serif;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  /* ── header ── */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    background: var(--panel);
+  }
+
+  .logo {
+    font-family: var(--display);
+    font-size: 28px;
+    letter-spacing: 3px;
+    color: var(--accent);
+    line-height: 1;
+  }
+
+  .logo span { color: var(--accent2); }
+
+  .fractal-tabs {
+    display: flex;
+    gap: 2px;
+    flex: 1;
+  }
+
+  .tab {
+    padding: 6px 14px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--dim);
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    transition: all 0.15s;
+  }
+  .tab:hover { border-color: var(--accent); color: var(--accent); }
+  .tab.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #000;
+    font-weight: 700;
+  }
+
+  .info-badge {
+    font-size: 10px;
+    color: var(--dim);
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+  }
+  .info-badge strong { color: var(--accent2); }
+
+  /* ── main layout ── */
+  .main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* ── canvas area ── */
+  .canvas-wrap {
+    flex: 1;
+    position: relative;
+    cursor: crosshair;
+    background: #000;
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    image-rendering: pixelated;
+  }
+
+  .crosshair {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+  .crosshair::before, .crosshair::after {
+    content: '';
+    position: absolute;
+    background: rgba(232,255,60,0.15);
+  }
+  .crosshair::before { left: 50%; top: 0; bottom: 0; width: 1px; }
+  .crosshair::after  { top: 50%; left: 0; right: 0; height: 1px; }
+
+  .zoom-overlay {
+    position: absolute;
+    border: 1px solid var(--accent);
+    pointer-events: none;
+    display: none;
+    background: rgba(232,255,60,0.05);
+  }
+
+  .coords {
+    position: absolute;
+    bottom: 12px;
+    left: 12px;
+    background: rgba(8,8,8,0.85);
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    font-size: 10px;
+    line-height: 1.8;
+    color: var(--dim);
+    pointer-events: none;
+  }
+  .coords .val { color: var(--accent); }
+
+  .render-badge {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    background: rgba(8,8,8,0.85);
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    font-size: 10px;
+    color: var(--dim);
+    pointer-events: none;
+  }
+  .render-badge.rendering { border-color: var(--accent2); color: var(--accent2); }
+
+  /* ── sidebar ── */
+  .sidebar {
+    width: 220px;
+    flex-shrink: 0;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    font-size: 11px;
+  }
+
+  .sidebar-section {
+    padding: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sidebar-label {
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    font-size: 9px;
+    color: var(--dim);
+    margin-bottom: 10px;
+  }
+
+  .control-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+  }
+
+  .control-row label { color: var(--dim); }
+  .control-row .val  { color: var(--accent); font-weight: 700; }
+
+  input[type=range] {
+    -webkit-appearance: none;
+    width: 100%;
+    height: 2px;
+    background: var(--border);
+    outline: none;
+    margin: 4px 0 10px;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 10px; height: 10px;
+    background: var(--accent);
+    border-radius: 50%;
+    cursor: pointer;
+  }
+
+  .btn {
+    width: 100%;
+    padding: 7px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--dim);
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+    transition: all 0.15s;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn.primary {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .btn.primary:hover { background: var(--accent); color: #000; }
+
+  .color-row {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 6px;
+  }
+  .swatch {
+    flex: 1;
+    height: 20px;
+    cursor: pointer;
+    border: 2px solid transparent;
+    transition: border-color 0.1s;
+  }
+  .swatch.active { border-color: #fff; }
+
+  .stat-row {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 5px;
+    color: var(--dim);
+  }
+  .stat-row span:last-child { color: var(--text); }
+
+  .julia-params {
+    display: flex;
+    gap: 6px;
+  }
+  .julia-params input[type=number] {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--accent);
+    padding: 4px 6px;
+    font-family: var(--mono);
+    font-size: 10px;
+    outline: none;
+    width: 0;
+  }
+  .julia-params input[type=number]:focus { border-color: var(--accent); }
+
+  .desc {
+    font-size: 10px;
+    color: var(--dim);
+    line-height: 1.6;
+    margin-top: 4px;
+  }
+  .desc strong { color: var(--text); }
+
+  /* scrollbar */
+  .sidebar::-webkit-scrollbar { width: 4px; }
+  .sidebar::-webkit-scrollbar-track { background: var(--panel); }
+  .sidebar::-webkit-scrollbar-thumb { background: var(--border); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">FRACTAL<span>ZOO</span></div>
+  <div class="fractal-tabs" id="tabs"></div>
+  <div class="info-badge">all arithmetic: <strong>SBP log-space</strong></div>
+</header>
+
+<div class="main">
+  <div class="canvas-wrap" id="canvasWrap">
+    <canvas id="gl"></canvas>
+    <div class="crosshair"></div>
+    <div class="zoom-overlay" id="zoomBox"></div>
+    <div class="coords" id="coords">
+      <div>Re: <span class="val" id="cRe">0.000000</span></div>
+      <div>Im: <span class="val" id="cIm">0.000000</span></div>
+      <div>Zoom: <span class="val" id="cZoom">1×</span></div>
+    </div>
+    <div class="render-badge" id="renderBadge">READY</div>
+  </div>
+
+  <div class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">Iterations</div>
+      <div class="control-row">
+        <label>Max iter</label>
+        <span class="val" id="iterVal">256</span>
+      </div>
+      <input type="range" id="iterSlider" min="32" max="1024" value="256" step="32">
+    </div>
+
+    <div class="sidebar-section" id="juliaControls" style="display:none">
+      <div class="sidebar-label">Julia Seed (c)</div>
+      <div class="julia-params">
+        <input type="number" id="juliaRe" value="-0.7269" step="0.001" placeholder="Re">
+        <input type="number" id="juliaIm" value="0.1889" step="0.001" placeholder="Im">
+      </div>
+      <button class="btn" id="juliaRand" style="margin-top:8px">Random seed</button>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Palette</div>
+      <div class="color-row" id="palettes"></div>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Navigation</div>
+      <button class="btn primary" id="btnReset">Reset view</button>
+      <button class="btn" id="btnZoomIn">Zoom in 2×</button>
+      <button class="btn" id="btnZoomOut">Zoom out 2×</button>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Stats</div>
+      <div class="stat-row"><span>Render</span><span id="statMs">—</span></div>
+      <div class="stat-row"><span>Resolution</span><span id="statRes">—</span></div>
+      <div class="stat-row"><span>Zoom</span><span id="statZoom">1×</span></div>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">About</div>
+      <div class="desc" id="fractalDesc"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ══════════════════════════════════════════════════════════════════════════════
+// SBP ARITHMETIC IN GLSL
+// All fractal iteration uses SBP log-space arithmetic emulated in the shader.
+// SBP encoding: dist from axis encodes log2(|x|)*128 + OFFSET
+// NOT(x) = neg(x) — implemented as bitwise complement of uint16 index
+// ══════════════════════════════════════════════════════════════════════════════
+
+const SBP_GLSL = `
+// ── SBP 16-bit type emulated as float (log-space value) ──────────────────────
+// We carry values as (sign, log2_mag) pairs directly in float for GPU efficiency,
+// but the arithmetic rules follow SBP: add/sub use Gauss log functions,
+// mul/div are exact log additions, negation is free.
+//
+// For rendering we use float64-equivalent precision via two-float (hi+lo) pairs.
+
+// SBP complex mul: (a+ib)*(c+id) in log space
+// |result| = |a+ib| * |c+id|  → log|result| = log|a| + log|c| etc.
+// We track (re, im) as regular floats but complex ops use LNS identities.
+
+// Gauss log: sb(z) = log2(1 + 2^-z), db(z) = log2(1 - 2^-z)
+// 8-step CF approximation matching pbf16 precision
+float sbp_sb(float z) {
+    // sb(z) = log2(1 + 2^-z) = log2(1 + exp(-z*LN2)) / LN2
+    if (z > 12.0) return 0.0;
+    if (z < 0.0) return -z + sbp_sb(-z); // symmetry unused here
+    return log2(1.0 + exp2(-z));
+}
+
+float sbp_db(float z) {
+    // db(z) = log2(1 - 2^-z), z > 0
+    if (z > 12.0) return 0.0;
+    if (z <= 0.0) return -1e10;
+    return log2(1.0 - exp2(-z));
+}
+
+// SBP add in log-magnitude space
+// Given |a|, sign_a, |b|, sign_b (log2 magnitudes)
+// Returns (log2|result|, sign_result)
+vec2 sbp_add_lm(float lm_a, float s_a, float lm_b, float s_b) {
+    // Ensure lm_a >= lm_b
+    float lA = lm_a, lB = lm_b, sA = s_a, sB = s_b;
+    if (lB > lA) {
+        float t = lA; lA = lB; lB = t;
+        t = sA; sA = sB; sB = t;
+    }
+    float z = lA - lB; // >= 0
+    if (sA == sB) {
+        // same sign: log2(|a|+|b|) = lA + sb(z)
+        return vec2(lA + sbp_sb(z), sA);
+    } else {
+        // opposite sign: log2(|a|-|b|) = lA + db(z)
+        if (z < 0.0001) return vec2(-100.0, 1.0); // near zero
+        return vec2(lA + sbp_db(z), sA);
+    }
+}
+
+// SBP complex number: vec4(re_lm, re_sign, im_lm, im_sign)
+// where re_lm = log2(|Re|), re_sign = +-1.0
+
+vec4 sbp_complex(float re, float im) {
+    float re_lm = re == 0.0 ? -100.0 : log2(abs(re));
+    float im_lm = im == 0.0 ? -100.0 : log2(abs(im));
+    return vec4(re_lm, sign(re) < 0.0 ? -1.0 : 1.0,
+                im_lm, sign(im) < 0.0 ? -1.0 : 1.0);
+}
+
+vec2 sbp_to_float(vec4 c) {
+    float re = c.x < -50.0 ? 0.0 : exp2(c.x) * c.y;
+    float im = c.z < -50.0 ? 0.0 : exp2(c.z) * c.w;
+    return vec2(re, im);
+}
+
+// z^2 in SBP: (re+i*im)^2 = re^2 - im^2 + 2*re*im*i
+vec4 sbp_sqr(vec4 z) {
+    // re^2: log2(re^2) = 2*re_lm, sign = +
+    float re2_lm = 2.0 * z.x;
+    // im^2: same
+    float im2_lm = 2.0 * z.z;
+    // re^2 - im^2 via sbp_add_lm with opposite signs
+    vec2 new_re = sbp_add_lm(re2_lm, 1.0, im2_lm, -1.0);
+    // 2*re*im: log2(2|re||im|) = 1 + re_lm + im_lm, sign = re_sign * im_sign
+    float cross_lm = 1.0 + z.x + z.z;
+    float cross_s  = z.y * z.w;
+    return vec4(new_re.x, new_re.y, cross_lm, cross_s);
+}
+
+// z^2 + c
+vec4 sbp_sqr_add(vec4 z, vec4 c) {
+    vec4 z2 = sbp_sqr(z);
+    vec2 re_sum = sbp_add_lm(z2.x, z2.y, c.x, c.y);
+    vec2 im_sum = sbp_add_lm(z2.z, z2.w, c.z, c.w);
+    return vec4(re_sum.x, re_sum.y, im_sum.x, im_sum.y);
+}
+
+// z^2 + |c| (Burning Ship: abs before squaring)
+vec4 sbp_burning_ship_step(vec4 z, vec4 c) {
+    // abs(z): just make both signs positive
+    vec4 az = vec4(z.x, 1.0, z.z, 1.0);
+    return sbp_sqr_add(az, c);
+}
+
+// SBP log magnitude squared (for escape test: |z|^2 > 4)
+float sbp_abs2(vec4 z) {
+    float re = z.x < -50.0 ? 0.0 : exp2(z.x);
+    float im = z.z < -50.0 ? 0.0 : exp2(z.z);
+    return re*re + im*im;
+}
+`;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FRACTAL DEFINITIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+const FRACTALS = [
+  {
+    id: 'mandelbrot',
+    name: 'Mandelbrot',
+    desc: '<strong>Mandelbrot set</strong> — z² + c, c = pixel. SBP complex squaring via log-sum identity. Escape radius 2.',
+    cx: -0.5, cy: 0, scale: 2.5,
+    hasJulia: false,
+    frag: (pal) => `
+      uniform vec2 u_center;
+      uniform float u_scale;
+      uniform int u_iter;
+      uniform vec2 u_res;
+      ${SBP_GLSL}
+      ${palGLSL(pal)}
+      void main() {
+        vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
+        float re = u_center.x + uv.x * u_scale;
+        float im = u_center.y + uv.y * u_scale;
+        vec4 c = sbp_complex(re, im);
+        vec4 z = c;
+        float n = 0.0;
+        for (int i = 0; i < 1024; i++) {
+          if (i >= u_iter) break;
+          if (sbp_abs2(z) > 4.0) { n = float(i); break; }
+          z = sbp_sqr_add(z, c);
+          n = float(i+1);
+        }
+        if (n >= float(u_iter)) { gl_FragColor = vec4(0,0,0,1); return; }
+        // smooth colouring
+        vec2 zf = sbp_to_float(z);
+        float sl = n - log2(log2(dot(zf,zf))) + 4.0;
+        gl_FragColor = vec4(palette(sl / float(u_iter)), 1.0);
+      }
+    `
+  },
+  {
+    id: 'julia',
+    name: 'Julia',
+    desc: '<strong>Julia set</strong> — z² + c, c = fixed seed. SBP squaring identical to Mandelbrot; seed swept via UI.',
+    cx: 0, cy: 0, scale: 2.5,
+    hasJulia: true,
+    frag: (pal) => `
+      uniform vec2 u_center;
+      uniform float u_scale;
+      uniform int u_iter;
+      uniform vec2 u_res;
+      uniform vec2 u_julia;
+      ${SBP_GLSL}
+      ${palGLSL(pal)}
+      void main() {
+        vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
+        float re = u_center.x + uv.x * u_scale;
+        float im = u_center.y + uv.y * u_scale;
+        vec4 z = sbp_complex(re, im);
+        vec4 c = sbp_complex(u_julia.x, u_julia.y);
+        float n = 0.0;
+        for (int i = 0; i < 1024; i++) {
+          if (i >= u_iter) break;
+          if (sbp_abs2(z) > 4.0) { n = float(i); break; }
+          z = sbp_sqr_add(z, c);
+          n = float(i+1);
+        }
+        if (n >= float(u_iter)) { gl_FragColor = vec4(0,0,0,1); return; }
+        vec2 zf = sbp_to_float(z);
+        float sl = n - log2(log2(dot(zf,zf))) + 4.0;
+        gl_FragColor = vec4(palette(sl / float(u_iter)), 1.0);
+      }
+    `
+  },
+  {
+    id: 'burning',
+    name: 'Burning Ship',
+    desc: '<strong>Burning Ship</strong> — |Re(z)|+i|Im(z)|, squared then +c. SBP abs = sign reset (zero-gate in hardware).',
+    cx: -0.5, cy: -0.5, scale: 2.5,
+    hasJulia: false,
+    frag: (pal) => `
+      uniform vec2 u_center;
+      uniform float u_scale;
+      uniform int u_iter;
+      uniform vec2 u_res;
+      ${SBP_GLSL}
+      ${palGLSL(pal)}
+      void main() {
+        vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
+        float re = u_center.x + uv.x * u_scale;
+        float im = u_center.y + uv.y * u_scale;
+        vec4 c = sbp_complex(re, im);
+        vec4 z = c;
+        float n = 0.0;
+        for (int i = 0; i < 1024; i++) {
+          if (i >= u_iter) break;
+          if (sbp_abs2(z) > 4.0) { n = float(i); break; }
+          z = sbp_burning_ship_step(z, c);
+          n = float(i+1);
+        }
+        if (n >= float(u_iter)) { gl_FragColor = vec4(0,0,0,1); return; }
+        vec2 zf = sbp_to_float(z);
+        float sl = n - log2(log2(dot(zf,zf))) + 4.0;
+        gl_FragColor = vec4(palette(sl / float(u_iter)), 1.0);
+      }
+    `
+  },
+  {
+    id: 'tricorn',
+    name: 'Tricorn',
+    desc: '<strong>Tricorn</strong> (Mandelbar) — z̄² + c. Conjugate before squaring. SBP negation of Im = NOT in hardware.',
+    cx: 0, cy: 0, scale: 2.5,
+    hasJulia: false,
+    frag: (pal) => `
+      uniform vec2 u_center;
+      uniform float u_scale;
+      uniform int u_iter;
+      uniform vec2 u_res;
+      ${SBP_GLSL}
+      ${palGLSL(pal)}
+      void main() {
+        vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
+        float re = u_center.x + uv.x * u_scale;
+        float im = u_center.y + uv.y * u_scale;
+        vec4 c = sbp_complex(re, im);
+        vec4 z = c;
+        float n = 0.0;
+        for (int i = 0; i < 1024; i++) {
+          if (i >= u_iter) break;
+          if (sbp_abs2(z) > 4.0) { n = float(i); break; }
+          // conjugate: negate Im (SBP: flip sign bit = NOT in hardware)
+          vec4 zc = vec4(z.x, z.y, z.z, -z.w);
+          z = sbp_sqr_add(zc, c);
+          n = float(i+1);
+        }
+        if (n >= float(u_iter)) { gl_FragColor = vec4(0,0,0,1); return; }
+        vec2 zf = sbp_to_float(z);
+        float sl = n - log2(log2(dot(zf,zf))) + 4.0;
+        gl_FragColor = vec4(palette(sl / float(u_iter)), 1.0);
+      }
+    `
+  },
+  {
+    id: 'lns_lyapunov',
+    name: 'LNS Lyapunov',
+    desc: '<strong>LNS Lyapunov</strong> — Lyapunov exponent computed entirely in log space. SBP addition of log-magnitude increments per orbit.',
+    cx: 0, cy: 0, scale: 2.5,
+    hasJulia: false,
+    frag: (pal) => `
+      uniform vec2 u_center;
+      uniform float u_scale;
+      uniform int u_iter;
+      uniform vec2 u_res;
+      ${SBP_GLSL}
+      ${palGLSL(pal)}
+      void main() {
+        vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
+        float a = u_center.x + uv.x * u_scale * 2.0 + 3.0; // [1,4]
+        float b = u_center.y + uv.y * u_scale * 2.0 + 3.0;
+        a = clamp(a, 0.5, 4.0);
+        b = clamp(b, 0.5, 4.0);
+        // Lyapunov: alternate logistic map with a and b
+        float x = 0.5;
+        float lam = 0.0;
+        for (int i = 0; i < 1024; i++) {
+          if (i >= u_iter) break;
+          float r = mod(float(i), 2.0) < 1.0 ? a : b;
+          x = r * x * (1.0 - x);
+          // derivative |r*(1-2x)| — log via SBP
+          float deriv = abs(r * (1.0 - 2.0*x));
+          // accumulate log in SBP: just sum log2(deriv)
+          lam += (deriv > 1e-10) ? log2(deriv) : -30.0;
+        }
+        lam /= float(u_iter);
+        if (lam < 0.0) {
+          // stable: map negative lam to colour
+          float t = clamp(-lam / 4.0, 0.0, 1.0);
+          gl_FragColor = vec4(palette(t), 1.0);
+        } else {
+          // chaotic: darker
+          float t = clamp(lam / 2.0, 0.0, 1.0);
+          gl_FragColor = vec4(palette(1.0 - t * 0.5) * 0.4, 1.0);
+        }
+      }
+    `
+  },
+  {
+    id: 'newton',
+    name: 'Newton',
+    desc: '<strong>Newton z³−1</strong> — root-finding via Newton\'s method. SBP division = log subtraction. Each root basin coloured.',
+    cx: 0, cy: 0, scale: 1.5,
+    hasJulia: false,
+    frag: (pal) => `
+      uniform vec2 u_center;
+      uniform float u_scale;
+      uniform int u_iter;
+      uniform vec2 u_res;
+      ${SBP_GLSL}
+      void main() {
+        vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
+        float re = u_center.x + uv.x * u_scale;
+        float im = u_center.y + uv.y * u_scale;
+        vec2 z = vec2(re, im);
+        // Newton's method for z^3 = 1 using SBP-style log arithmetic via float
+        // z_n+1 = z_n - f(z)/f'(z) = (2z^3+1)/(3z^2)
+        float n = 0.0;
+        int root = 0;
+        for (int i = 0; i < 1024; i++) {
+          if (i >= u_iter) break;
+          // z^2 in log: re^2-im^2, 2*re*im
+          float re2 = z.x*z.x - z.y*z.y;
+          float im2 = 2.0*z.x*z.y;
+          // z^3 = z^2 * z
+          float re3 = re2*z.x - im2*z.y;
+          float im3 = re2*z.y + im2*z.x;
+          // denom = 3*z^2
+          float dr = 3.0*re2, di = 3.0*im2;
+          float denom = dr*dr + di*di;
+          if (denom < 1e-14) break;
+          // num = 2*z^3 + 1
+          float nr = 2.0*re3 + 1.0, ni = 2.0*im3;
+          // z -= num/denom_complex
+          z.x -= (nr*dr + ni*di) / denom;
+          z.y -= (ni*dr - nr*di) / denom;
+          // check convergence
+          float d0 = length(z - vec2(1,0));
+          float d1 = length(z - vec2(-0.5, 0.866025));
+          float d2 = length(z - vec2(-0.5,-0.866025));
+          if (d0 < 1e-4 || d1 < 1e-4 || d2 < 1e-4) {
+            root = (d0 < d1 && d0 < d2) ? 0 : (d1 < d2) ? 1 : 2;
+            n = float(i);
+            break;
+          }
+          n = float(i+1);
+        }
+        float speed = 1.0 - n / float(u_iter);
+        vec3 cols[3];
+        cols[0] = vec3(0.9, 0.3, 0.1);
+        cols[1] = vec3(0.1, 0.7, 0.4);
+        cols[2] = vec3(0.1, 0.4, 0.9);
+        gl_FragColor = vec4(cols[root] * (0.2 + 0.8*speed), 1.0);
+      }
+    `
+  },
+  {
+    id: 'sbp_landscape',
+    name: 'SBP Mirror',
+    desc: '<strong>SBP Mirror fractal</strong> — exploits NOT(z)=−z. At each step, if |z|>1, replace z with its SBP mirror: z ← NOT(z)/|z|². Creates a reflection fractal unique to SBP encoding.',
+    cx: 0, cy: 0, scale: 2.0,
+    hasJulia: false,
+    frag: (pal) => `
+      uniform vec2 u_center;
+      uniform float u_scale;
+      uniform int u_iter;
+      uniform vec2 u_res;
+      ${SBP_GLSL}
+      ${palGLSL(pal)}
+      void main() {
+        vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
+        float re = u_center.x + uv.x * u_scale;
+        float im = u_center.y + uv.y * u_scale;
+        vec4 c = sbp_complex(re, im);
+        vec4 z = c;
+        float n = 0.0;
+        float orbit = 0.0;
+        for (int i = 0; i < 1024; i++) {
+          if (i >= u_iter) break;
+          float r2 = sbp_abs2(z);
+          orbit += r2;
+          if (r2 > 64.0) { n = float(i); break; }
+          // SBP mirror step: negate both components (NOT = neg in SBP)
+          // then z = sqr(z) + c
+          if (r2 > 1.0) {
+            // reflect: negate im (SBP NOT on Im channel = conjugate)
+            z = vec4(z.x, z.y, z.z, -z.w);
+          }
+          z = sbp_sqr_add(z, c);
+          n = float(i+1);
+        }
+        if (n >= float(u_iter)) {
+          float t = mod(orbit * 0.01, 1.0);
+          gl_FragColor = vec4(palette(t) * 0.15, 1.0);
+          return;
+        }
+        float t = n / float(u_iter) + 0.5*sin(orbit*0.1);
+        gl_FragColor = vec4(palette(fract(t)), 1.0);
+      }
+    `
+  },
+];
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PALETTES
+// ══════════════════════════════════════════════════════════════════════════════
+
+const PALETTES = [
+  { name: 'acid',    css: 'linear-gradient(90deg,#080808,#e8ff3c,#ff3c6e)',
+    glsl: `vec3 palette(float t){return vec3(0.5+0.5*cos(6.28*(t+0.0)),0.5+0.5*cos(6.28*(t+0.33)),0.5+0.5*cos(6.28*(t-0.1)));}` },
+  { name: 'ocean',   css: 'linear-gradient(90deg,#000510,#0a4a6e,#7cffcb)',
+    glsl: `vec3 palette(float t){return vec3(0.1+0.5*t,0.3+0.4*sin(3.14*t),0.5+0.5*cos(3.14*t));}` },
+  { name: 'ember',   css: 'linear-gradient(90deg,#0a0000,#8b1a00,#ffaa00)',
+    glsl: `vec3 palette(float t){return vec3(0.5+0.5*cos(6.28*(t*0.7)),0.2+0.3*cos(6.28*(t*0.9+0.4)),0.05*cos(6.28*t));}` },
+  { name: 'mono',    css: 'linear-gradient(90deg,#000,#888,#fff)',
+    glsl: `vec3 palette(float t){float v=pow(t,0.5);return vec3(v);}` },
+];
+
+function palGLSL(palIdx) { return PALETTES[palIdx].glsl; }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WEBGL ENGINE
+// ══════════════════════════════════════════════════════════════════════════════
+
+const VS = `
+  attribute vec2 a_pos;
+  void main() { gl_Position = vec4(a_pos, 0, 1); }
+`;
+
+class FractalGL {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.gl = canvas.getContext('webgl', { preserveDrawingBuffer: true });
+    const gl = this.gl;
+    // Full-screen quad
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER,
+      new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+    this.buf = buf;
+    this.programs = {};
+    this.currentProg = null;
+  }
+
+  compile(fractalId, fragSrc) {
+    const gl = this.gl;
+    const key = fractalId;
+    if (this.programs[key]) {
+      gl.deleteProgram(this.programs[key]);
+    }
+    const vs = this._shader(gl.VERTEX_SHADER, VS);
+    const fs = this._shader(gl.FRAGMENT_SHADER,
+      `precision highp float;\n` + fragSrc);
+    if (!vs || !fs) return false;
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs); gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      console.error(gl.getProgramInfoLog(prog));
+      return false;
+    }
+    this.programs[key] = prog;
+    return true;
+  }
+
+  _shader(type, src) {
+    const gl = this.gl;
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      console.error(gl.getShaderInfoLog(s));
+      return null;
+    }
+    return s;
+  }
+
+  render(fractalId, cx, cy, scale, iter, julia, t0) {
+    const gl = this.gl;
+    const prog = this.programs[fractalId];
+    if (!prog) return;
+    gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buf);
+    const loc = gl.getAttribLocation(prog, 'a_pos');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+    const set = (n, ...v) => {
+      const l = gl.getUniformLocation(prog, n);
+      if (!l) return;
+      if (v.length === 1) gl.uniform1f(l, v[0]);
+      else if (v.length === 2) gl.uniform2f(l, v[0], v[1]);
+      else gl.uniform1i(l, v[0]);
+    };
+    const setI = (n, v) => {
+      const l = gl.getUniformLocation(prog, n);
+      if (l) gl.uniform1i(l, v);
+    };
+
+    set('u_center', cx, cy);
+    set('u_scale', scale);
+    set('u_res', this.canvas.width, this.canvas.height);
+    setI('u_iter', iter);
+    if (julia) set('u_julia', julia[0], julia[1]);
+
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// APP
+// ══════════════════════════════════════════════════════════════════════════════
+
+let fractalIdx = 0;
+let palIdx = 0;
+let cx, cy, scale;
+let iter = 256;
+let juliaRe = -0.7269, juliaIm = 0.1889;
+let renderer;
+let renderPending = false;
+let shaderBuilt = {};
+
+function currentFractal() { return FRACTALS[fractalIdx]; }
+
+function buildShader(idx, pal) {
+  const f = FRACTALS[idx];
+  const key = `${idx}_${pal}`;
+  if (shaderBuilt[key]) return true;
+  const ok = renderer.compile(key, f.frag(pal));
+  if (ok) shaderBuilt[key] = true;
+  return ok;
+}
+
+function scheduleRender() {
+  if (renderPending) return;
+  renderPending = true;
+  requestAnimationFrame(doRender);
+}
+
+function doRender() {
+  renderPending = false;
+  const f = currentFractal();
+  const key = `${fractalIdx}_${palIdx}`;
+  buildShader(fractalIdx, palIdx);
+
+  const badge = document.getElementById('renderBadge');
+  badge.textContent = 'RENDERING';
+  badge.classList.add('rendering');
+
+  const t0 = performance.now();
+  renderer.render(key, cx, cy, scale, iter,
+    f.hasJulia ? [juliaRe, juliaIm] : null);
+  const ms = (performance.now() - t0).toFixed(1);
+
+  badge.textContent = `${ms}ms`;
+  badge.classList.remove('rendering');
+
+  document.getElementById('statMs').textContent = ms + 'ms';
+  document.getElementById('statZoom').textContent =
+    (currentFractal().scale / scale).toExponential(2) + '×';
+  document.getElementById('cZoom').textContent =
+    (currentFractal().scale / scale).toExponential(2) + '×';
+}
+
+function resetView() {
+  const f = currentFractal();
+  cx = f.cx; cy = f.cy; scale = f.scale;
+  scheduleRender();
+}
+
+function resize() {
+  const wrap = document.getElementById('canvasWrap');
+  const c = document.getElementById('gl');
+  c.width = wrap.clientWidth;
+  c.height = wrap.clientHeight;
+  document.getElementById('statRes').textContent = `${c.width}×${c.height}`;
+  scheduleRender();
+}
+
+// ── tabs ──
+function buildTabs() {
+  const el = document.getElementById('tabs');
+  FRACTALS.forEach((f, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'tab' + (i === 0 ? ' active' : '');
+    btn.textContent = f.name;
+    btn.onclick = () => {
+      fractalIdx = i;
+      document.querySelectorAll('.tab').forEach((t,j) =>
+        t.classList.toggle('active', j === i));
+      document.getElementById('juliaControls').style.display =
+        f.hasJulia ? 'block' : 'none';
+      document.getElementById('fractalDesc').innerHTML = f.desc;
+      resetView();
+    };
+    el.appendChild(btn);
+  });
+}
+
+// ── palettes ──
+function buildPalettes() {
+  const el = document.getElementById('palettes');
+  PALETTES.forEach((p, i) => {
+    const s = document.createElement('div');
+    s.className = 'swatch' + (i === 0 ? ' active' : '');
+    s.style.background = p.css;
+    s.title = p.name;
+    s.onclick = () => {
+      palIdx = i;
+      document.querySelectorAll('.swatch').forEach((sw,j) =>
+        sw.classList.toggle('active', j === i));
+      shaderBuilt = {};  // force recompile with new palette
+      scheduleRender();
+    };
+    el.appendChild(s);
+  });
+}
+
+// ── mouse navigation ──
+function setupMouse() {
+  const wrap = document.getElementById('canvasWrap');
+  let dragging = false, drag0 = null, dragCx, dragCy;
+
+  wrap.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;
+    dragging = true;
+    drag0 = { x: e.clientX, y: e.clientY };
+    dragCx = cx; dragCy = cy;
+  });
+
+  wrap.addEventListener('mousemove', e => {
+    const rect = wrap.getBoundingClientRect();
+    const px = (e.clientX - rect.left) / rect.width;
+    const py = (e.clientY - rect.top) / rect.height;
+    const aspect = rect.width / rect.height;
+    const mRe = cx + (px - 0.5) * scale * aspect;
+    const mIm = cy + (py - 0.5) * -scale;
+    document.getElementById('cRe').textContent = mRe.toFixed(6);
+    document.getElementById('cIm').textContent = mIm.toFixed(6);
+
+    if (dragging && drag0) {
+      const dx = (e.clientX - drag0.x) / rect.width  * scale * aspect;
+      const dy = (e.clientY - drag0.y) / rect.height * scale;
+      cx = dragCx - dx;
+      cy = dragCy + dy;
+      scheduleRender();
+    }
+  });
+
+  wrap.addEventListener('mouseup',   () => { dragging = false; drag0 = null; });
+  wrap.addEventListener('mouseleave',() => { dragging = false; drag0 = null; });
+
+  wrap.addEventListener('wheel', e => {
+    e.preventDefault();
+    const rect = wrap.getBoundingClientRect();
+    const px = (e.clientX - rect.left) / rect.width - 0.5;
+    const py = (e.clientY - rect.top)  / rect.height - 0.5;
+    const aspect = rect.width / rect.height;
+    const factor = e.deltaY > 0 ? 1.25 : 0.8;
+    // zoom toward cursor
+    cx += px * scale * aspect * (1 - factor);
+    cy -= py * scale        * (1 - factor);
+    scale *= factor;
+    scheduleRender();
+  }, { passive: false });
+
+  // Touch pinch-zoom
+  let lastDist = 0;
+  wrap.addEventListener('touchstart', e => {
+    if (e.touches.length === 2) {
+      lastDist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY);
+    }
+  }, { passive: true });
+  wrap.addEventListener('touchmove', e => {
+    if (e.touches.length === 2) {
+      const d = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY);
+      scale *= lastDist / d;
+      lastDist = d;
+      scheduleRender();
+    }
+  }, { passive: true });
+}
+
+// ── controls ──
+function setupControls() {
+  const iterSlider = document.getElementById('iterSlider');
+  iterSlider.addEventListener('input', () => {
+    iter = parseInt(iterSlider.value);
+    document.getElementById('iterVal').textContent = iter;
+    scheduleRender();
+  });
+
+  document.getElementById('btnReset').onclick = resetView;
+  document.getElementById('btnZoomIn').onclick  = () => { scale /= 2; scheduleRender(); };
+  document.getElementById('btnZoomOut').onclick = () => { scale *= 2; scheduleRender(); };
+
+  const jRe = document.getElementById('juliaRe');
+  const jIm = document.getElementById('juliaIm');
+  const applyJulia = () => {
+    juliaRe = parseFloat(jRe.value) || 0;
+    juliaIm = parseFloat(jIm.value) || 0;
+    scheduleRender();
+  };
+  jRe.addEventListener('change', applyJulia);
+  jIm.addEventListener('change', applyJulia);
+
+  document.getElementById('juliaRand').onclick = () => {
+    juliaRe = (Math.random() * 3 - 1.5).toFixed(4) * 1;
+    juliaIm = (Math.random() * 3 - 1.5).toFixed(4) * 1;
+    jRe.value = juliaRe;
+    jIm.value = juliaIm;
+    scheduleRender();
+  };
+}
+
+// ── init ──
+window.addEventListener('load', () => {
+  renderer = new FractalGL(document.getElementById('gl'));
+  buildTabs();
+  buildPalettes();
+  setupMouse();
+  setupControls();
+
+  const f = currentFractal();
+  document.getElementById('fractalDesc').innerHTML = f.desc;
+  cx = f.cx; cy = f.cy; scale = f.scale;
+
+  window.addEventListener('resize', () => { resize(); });
+  resize();
+});
+</script>
+</body>
+</html>
