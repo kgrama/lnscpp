@@ -17,7 +17,7 @@ Table-free 16-bit LNS arithmetic for C++. Drop-in replacement for [`xlns16.cpp`]
 
 ---
 
-## Usage
+## Usage  -- Broken
 
 Replace:
 ```cpp
