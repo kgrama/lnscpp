@@ -1,17 +1,57 @@
 CXX      = g++
-CXXFLAGS = -std=c++11 -O2 -I.
-TEST     = tests/sbp_vs_pbf_test.cpp
+CXXFLAGS = -std=c++11 -O2 -Wall -I.
+LDLIBS   = -lm
+BUILD    = build
 
-all: run
+# ── PBF (Parameterized Bounded Format) targets ────────────────────────────────
+PBF_BINS = $(BUILD)/pbftest $(BUILD)/pbf_xlns_test
 
-pbf_test:    $(TEST); $(CXX) $(CXXFLAGS)            -o $@ $< -lm
-sbp_test:    $(TEST); $(CXX) $(CXXFLAGS) -DUSE_SBP  -o $@ $< -lm
-bfloat_test: $(TEST); $(CXX) $(CXXFLAGS) -DUSE_BFLOAT -o $@ $< -lm
+# ── xlns32 (32-bit LNS) targets ───────────────────────────────────────────────
+XLNS32_BINS = $(BUILD)/xlns32test $(BUILD)/xlns32funtest \
+              $(BUILD)/xlns32_new_functions_test \
+              $(BUILD)/xlns32_cmp_util_const_test \
+              $(BUILD)/xlns32_explog_test \
+              $(BUILD)/xlns32_batch_layernorm_test
 
-run: pbf_test sbp_test bfloat_test
-	@echo ""; @echo "══ PBF ══════════════════════════════════════════════"; ./pbf_test
-	@echo ""; @echo "══ SBP ══════════════════════════════════════════════"; ./sbp_test
-	@echo ""; @echo "══ BFLOAT16 ═════════════════════════════════════════"; ./bfloat_test
+all: $(PBF_BINS) $(XLNS32_BINS)
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+# ── PBF builds ────────────────────────────────────────────────────────────────
+$(BUILD)/pbftest:       pbftest.cpp pbf.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDLIBS)
+
+$(BUILD)/pbf_xlns_test: pbf_xlns_test.cpp pbf_xlns.cpp pbf_batch.cpp pbf.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDLIBS)
+
+# ── xlns32 top-level tests ────────────────────────────────────────────────────
+$(BUILD)/xlns32test:                   xlns32test.cpp xlns32.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDLIBS)
+$(BUILD)/xlns32funtest:                xlns32funtest.cpp xlns32.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDLIBS)
+$(BUILD)/xlns32_new_functions_test:    xlns32_new_functions_test.cpp xlns32.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDLIBS)
+
+# ── xlns32 tests/ subdirectory ────────────────────────────────────────────────
+$(BUILD)/xlns32_cmp_util_const_test:   tests/xlns32_cmp_util_const_test.cpp xlns32.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDLIBS)
+$(BUILD)/xlns32_explog_test:           tests/xlns32_explog_test.cpp xlns32.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDLIBS)
+$(BUILD)/xlns32_batch_layernorm_test:  tests/xlns32_batch_layernorm_test.cpp xlns32.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDLIBS)
+
+# ── Convenience targets ───────────────────────────────────────────────────────
+.PHONY: pbf xlns32 run clean
+
+pbf:    $(PBF_BINS)
+xlns32: $(XLNS32_BINS)
+
+run: $(BUILD)/pbftest $(BUILD)/pbf_xlns_test
+	@echo ""; echo "══ PBF SNR demo ═════════════════════════════════════"
+	$(BUILD)/pbftest
+	@echo ""; echo "══ xlns16 API shim over PBF16 ═══════════════════════"
+	$(BUILD)/pbf_xlns_test
 
 clean:
-	rm -f pbf_test sbp_test bfloat_test
+	rm -rf $(BUILD)

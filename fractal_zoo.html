@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FRACTAL ZOO — SBP Arithmetic</title>
+<title>FRACTAL ZOO — PBF Arithmetic</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Bebas+Neue&display=swap" rel="stylesheet">
 <style>
@@ -230,6 +230,17 @@
   }
   .btn.primary:hover { background: var(--accent); color: #000; }
 
+  .format-row {
+    display: flex;
+    gap: 6px;
+  }
+  .format-row .btn { margin-bottom: 0; width: 50%; }
+  .format-row .btn.active {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: rgba(232, 255, 60, 0.08);
+  }
+
   .color-row {
     display: flex;
     gap: 4px;
@@ -288,7 +299,7 @@
 <header>
   <div class="logo">FRACTAL<span>ZOO</span></div>
   <div class="fractal-tabs" id="tabs"></div>
-  <div class="info-badge">all arithmetic: <strong>SBP log-space</strong></div>
+  <div class="info-badge" id="formatBadge">arithmetic: <strong>PBF8</strong> (int mul/div, softplus add)</div>
 </header>
 
 <div class="main">
@@ -324,6 +335,14 @@
     </div>
 
     <div class="sidebar-section">
+      <div class="sidebar-label">Format</div>
+      <div class="format-row" id="formats">
+        <button class="btn format-btn active" data-bits="8">PBF8</button>
+        <button class="btn format-btn" data-bits="16">PBF16</button>
+      </div>
+    </div>
+
+    <div class="sidebar-section">
       <div class="sidebar-label">Palette</div>
       <div class="color-row" id="palettes"></div>
     </div>
@@ -351,111 +370,206 @@
 
 <script>
 // ══════════════════════════════════════════════════════════════════════════════
-// SBP ARITHMETIC IN GLSL
-// All fractal iteration uses SBP log-space arithmetic emulated in the shader.
-// SBP encoding: dist from axis encodes log2(|x|)*128 + OFFSET
-// NOT(x) = neg(x) — implemented as bitwise complement of uint16 index
+// PBF CPU-SIDE CONSTANTS (PBF8 and PBF16)
+// Mirrors pbf8_init / pbf16_init in pbf.cpp. Values pushed as uniforms.
 // ══════════════════════════════════════════════════════════════════════════════
 
-const SBP_GLSL = `
-// ── SBP 16-bit type emulated as float (log-space value) ──────────────────────
-// We carry values as (sign, log2_mag) pairs directly in float for GPU efficiency,
-// but the arithmetic rules follow SBP: add/sub use Gauss log functions,
-// mul/div are exact log additions, negation is free.
-//
-// For rendering we use float64-equivalent precision via two-float (hi+lo) pairs.
+function makePbf(n_bits, v_min, v_max) {
+  const mid          = 1 << (n_bits - 1);
+  const n_levels     = mid - 1;
+  const max_code     = (1 << n_bits) - 1;
+  const ln_per_level = Math.log(v_max / v_min) / n_levels;
+  const offset       = Math.round(Math.log(v_min) / ln_per_level);
 
-// SBP complex mul: (a+ib)*(c+id) in log space
-// |result| = |a+ib| * |c+id|  → log|result| = log|a| + log|c| etc.
-// We track (re, im) as regular floats but complex ops use LNS identities.
+  const encode = (v) => {
+    if (v === 0) return 0;
+    let mag = Math.abs(v);
+    if (mag < v_min) mag = v_min;
+    if (mag > v_max) mag = v_max;
+    let level = Math.round(Math.log(mag / v_min) / ln_per_level);
+    if (level < 0) level = 0;
+    if (level > n_levels - 1) level = n_levels - 1;
+    return v > 0 ? mid + level : mid - 1 - level;
+  };
 
-// Gauss log: sb(z) = log2(1 + 2^-z), db(z) = log2(1 - 2^-z)
-// 8-step CF approximation matching pbf16 precision
-float sbp_sb(float z) {
-    // sb(z) = log2(1 + 2^-z) = log2(1 + exp(-z*LN2)) / LN2
-    if (z > 12.0) return 0.0;
-    if (z < 0.0) return -z + sbp_sb(-z); // symmetry unused here
-    return log2(1.0 + exp2(-z));
+  return {
+    n_bits, v_min, v_max, mid, n_levels, max_code, ln_per_level, offset,
+    pbf_one:   encode(1.0),
+    pbf_two:   encode(2.0),
+    pbf_three: encode(3.0),
+    encode,
+  };
 }
 
-float sbp_db(float z) {
-    // db(z) = log2(1 - 2^-z), z > 0
-    if (z > 12.0) return 0.0;
-    if (z <= 0.0) return -1e10;
-    return log2(1.0 - exp2(-z));
+const PBF8  = makePbf(8,  1e-4, 1e4);
+const PBF16 = makePbf(16, 1e-8, 1e8);
+let currentFormat = PBF8;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PBF8 INTEGER ARITHMETIC IN GLSL
+// Codes are ints in [0, 255]. Zero → 0, infinity → 255, negatives < 128,
+// positives ≥ 128. Multiplication and division are pure integer adds on
+// magnitude levels. Addition uses softplus/softminus at the float boundary
+// (GPUs lack int64 for the Q32 CF used in pbf.cpp).
+// ══════════════════════════════════════════════════════════════════════════════
+
+const PBF_GLSL = `
+// ── PBF format parameters (set from JS; PBF8 or PBF16) ──────────────────────
+uniform int   PBF_MID;         // 1 << (n_bits - 1)
+uniform int   PBF_MAX;         // (1 << n_bits) - 1, infinity sentinel
+uniform int   PBF_LEVELS;      // mid - 1
+uniform float u_ln_per_level;  // ln(v_max/v_min) / n_levels
+uniform float u_vmin;
+uniform int   u_offset;        // precomputed round(ln(v_min) / scale_ln)
+uniform int   u_pbf_one;       // pbf_encode(1.0)
+uniform int   u_pbf_two;       // pbf_encode(2.0)
+uniform int   u_pbf_three;     // pbf_encode(3.0)
+
+// ── Primitives ──────────────────────────────────────────────────────────────
+
+int pbf_neg(int a) {
+    if (a == 0 || a == PBF_MAX) return a;
+    return PBF_MAX - a;
 }
 
-// SBP add in log-magnitude space
-// Given |a|, sign_a, |b|, sign_b (log2 magnitudes)
-// Returns (log2|result|, sign_result)
-vec2 sbp_add_lm(float lm_a, float s_a, float lm_b, float s_b) {
-    // Ensure lm_a >= lm_b
-    float lA = lm_a, lB = lm_b, sA = s_a, sB = s_b;
-    if (lB > lA) {
-        float t = lA; lA = lB; lB = t;
-        t = sA; sA = sB; sB = t;
-    }
-    float z = lA - lB; // >= 0
-    if (sA == sB) {
-        // same sign: log2(|a|+|b|) = lA + sb(z)
-        return vec2(lA + sbp_sb(z), sA);
+int pbf_abs(int a) {
+    if (a == 0 || a >= PBF_MID) return a;
+    return pbf_neg(a);
+}
+
+int pbf_encode(float v) {
+    if (v == 0.0) return 0;
+    float mag = abs(v);
+    if (mag < u_vmin) mag = u_vmin;
+    int level = int(floor(log(mag / u_vmin) / u_ln_per_level + 0.5));
+    if (level < 0) level = 0;
+    if (level > PBF_LEVELS - 1) level = PBF_LEVELS - 1;
+    return (v > 0.0) ? (PBF_MID + level) : (PBF_MID - 1 - level);
+}
+
+float pbf_decode(int code) {
+    if (code == 0)       return 0.0;
+    if (code == PBF_MAX) return 1e30;
+    float s;
+    int lvl;
+    if (code >= PBF_MID) { s =  1.0; lvl = code - PBF_MID; }
+    else                 { s = -1.0; lvl = PBF_MID - 1 - code; }
+    return s * u_vmin * exp(float(lvl) * u_ln_per_level);
+}
+
+// Multiplication: pure integer adds on magnitude levels.
+int pbf_mul(int a, int b) {
+    if (a == 0 || b == 0) return 0;
+    if (a == PBF_MAX || b == PBF_MAX) return PBF_MAX;
+    int an = (a < PBF_MID) ? 1 : 0;
+    int bn = (b < PBF_MID) ? 1 : 0;
+    int am = (an == 1) ? (PBF_MID - 1 - a) : (a - PBF_MID);
+    int bm = (bn == 1) ? (PBF_MID - 1 - b) : (b - PBF_MID);
+    int cm = am + bm + u_offset;
+    if (cm < 0)           return 0;
+    if (cm >= PBF_LEVELS) return PBF_MAX;
+    int cn = an + bn - 2 * an * bn;  // XOR on 0/1
+    return (cn == 1) ? (PBF_MID - 1 - cm) : (PBF_MID + cm);
+}
+
+int pbf_div(int a, int b) {
+    if (a == 0) return 0;
+    if (b == 0 || a == PBF_MAX) return PBF_MAX;
+    if (b == PBF_MAX) return 0;
+    int an = (a < PBF_MID) ? 1 : 0;
+    int bn = (b < PBF_MID) ? 1 : 0;
+    int am = (an == 1) ? (PBF_MID - 1 - a) : (a - PBF_MID);
+    int bm = (bn == 1) ? (PBF_MID - 1 - b) : (b - PBF_MID);
+    int cm = am - bm - u_offset;
+    if (cm < 0)           return 0;
+    if (cm >= PBF_LEVELS) return PBF_MAX;
+    int cn = an + bn - 2 * an * bn;
+    return (cn == 1) ? (PBF_MID - 1 - cm) : (PBF_MID + cm);
+}
+
+// Addition: softplus on same sign, softminus on opposite.
+int pbf_add(int a, int b) {
+    if (a == 0) return b;
+    if (b == 0) return a;
+    if (a == PBF_MAX || b == PBF_MAX) return PBF_MAX;
+    int an = (a < PBF_MID) ? 1 : 0;
+    int bn = (b < PBF_MID) ? 1 : 0;
+    int am = (an == 1) ? (PBF_MID - 1 - a) : (a - PBF_MID);
+    int bm = (bn == 1) ? (PBF_MID - 1 - b) : (b - PBF_MID);
+    int cm, cn;
+    if (an == bn) {
+        int hi = (am > bm) ? am : bm;
+        int lo = (am > bm) ? bm : am;
+        float d    = float(lo - hi) * u_ln_per_level;      // <= 0
+        float corr = log(1.0 + exp(d));                    // softplus
+        cm = hi + int(floor(corr / u_ln_per_level + 0.5));
+        cn = an;
     } else {
-        // opposite sign: log2(|a|-|b|) = lA + db(z)
-        if (z < 0.0001) return vec2(-100.0, 1.0); // near zero
-        return vec2(lA + sbp_db(z), sA);
+        if (am == bm) return 0;
+        int hi, lo;
+        if (am > bm) { hi = am; lo = bm; cn = an; }
+        else         { hi = bm; lo = am; cn = bn; }
+        float d    = float(lo - hi) * u_ln_per_level;      // < 0
+        float corr = log(1.0 - exp(d));                    // softminus
+        if (corr != corr) corr = -30.0;                    // NaN guard
+        cm = hi + int(floor(corr / u_ln_per_level + 0.5));
     }
+    if (cm < 0)           cm = 0;
+    if (cm >= PBF_LEVELS) cm = PBF_LEVELS - 1;
+    return (cn == 1) ? (PBF_MID - 1 - cm) : (PBF_MID + cm);
 }
 
-// SBP complex number: vec4(re_lm, re_sign, im_lm, im_sign)
-// where re_lm = log2(|Re|), re_sign = +-1.0
+int pbf_sub(int a, int b) { return pbf_add(a, pbf_neg(b)); }
 
-vec4 sbp_complex(float re, float im) {
-    float re_lm = re == 0.0 ? -100.0 : log2(abs(re));
-    float im_lm = im == 0.0 ? -100.0 : log2(abs(im));
-    return vec4(re_lm, sign(re) < 0.0 ? -1.0 : 1.0,
-                im_lm, sign(im) < 0.0 ? -1.0 : 1.0);
+// ── Complex helpers (ivec2 = (re_code, im_code)) ────────────────────────────
+
+ivec2 pbfc_encode(float re, float im) {
+    return ivec2(pbf_encode(re), pbf_encode(im));
 }
 
-vec2 sbp_to_float(vec4 c) {
-    float re = c.x < -50.0 ? 0.0 : exp2(c.x) * c.y;
-    float im = c.z < -50.0 ? 0.0 : exp2(c.z) * c.w;
-    return vec2(re, im);
+vec2 pbfc_decode(ivec2 z) {
+    return vec2(pbf_decode(z.x), pbf_decode(z.y));
 }
 
-// z^2 in SBP: (re+i*im)^2 = re^2 - im^2 + 2*re*im*i
-vec4 sbp_sqr(vec4 z) {
-    // re^2: log2(re^2) = 2*re_lm, sign = +
-    float re2_lm = 2.0 * z.x;
-    // im^2: same
-    float im2_lm = 2.0 * z.z;
-    // re^2 - im^2 via sbp_add_lm with opposite signs
-    vec2 new_re = sbp_add_lm(re2_lm, 1.0, im2_lm, -1.0);
-    // 2*re*im: log2(2|re||im|) = 1 + re_lm + im_lm, sign = re_sign * im_sign
-    float cross_lm = 1.0 + z.x + z.z;
-    float cross_s  = z.y * z.w;
-    return vec4(new_re.x, new_re.y, cross_lm, cross_s);
+// (a + bi)^2 = (a^2 - b^2) + 2ab·i
+ivec2 pbfc_sqr(ivec2 z) {
+    int r2 = pbf_mul(z.x, z.x);
+    int i2 = pbf_mul(z.y, z.y);
+    int ri = pbf_mul(u_pbf_two, pbf_mul(z.x, z.y));
+    return ivec2(pbf_sub(r2, i2), ri);
 }
 
-// z^2 + c
-vec4 sbp_sqr_add(vec4 z, vec4 c) {
-    vec4 z2 = sbp_sqr(z);
-    vec2 re_sum = sbp_add_lm(z2.x, z2.y, c.x, c.y);
-    vec2 im_sum = sbp_add_lm(z2.z, z2.w, c.z, c.w);
-    return vec4(re_sum.x, re_sum.y, im_sum.x, im_sum.y);
+ivec2 pbfc_sqr_add(ivec2 z, ivec2 c) {
+    ivec2 z2 = pbfc_sqr(z);
+    return ivec2(pbf_add(z2.x, c.x), pbf_add(z2.y, c.y));
 }
 
-// z^2 + |c| (Burning Ship: abs before squaring)
-vec4 sbp_burning_ship_step(vec4 z, vec4 c) {
-    // abs(z): just make both signs positive
-    vec4 az = vec4(z.x, 1.0, z.z, 1.0);
-    return sbp_sqr_add(az, c);
+ivec2 pbfc_burning(ivec2 z, ivec2 c) {
+    return pbfc_sqr_add(ivec2(pbf_abs(z.x), pbf_abs(z.y)), c);
 }
 
-// SBP log magnitude squared (for escape test: |z|^2 > 4)
-float sbp_abs2(vec4 z) {
-    float re = z.x < -50.0 ? 0.0 : exp2(z.x);
-    float im = z.z < -50.0 ? 0.0 : exp2(z.z);
-    return re*re + im*im;
+// Complex addition / subtraction (element-wise)
+ivec2 pbfc_add(ivec2 a, ivec2 b) { return ivec2(pbf_add(a.x, b.x), pbf_add(a.y, b.y)); }
+ivec2 pbfc_sub(ivec2 a, ivec2 b) { return ivec2(pbf_sub(a.x, b.x), pbf_sub(a.y, b.y)); }
+
+// Complex multiplication: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+ivec2 pbfc_mul(ivec2 a, ivec2 b) {
+    return ivec2(pbf_sub(pbf_mul(a.x, b.x), pbf_mul(a.y, b.y)),
+                 pbf_add(pbf_mul(a.x, b.y), pbf_mul(a.y, b.x)));
+}
+
+// Complex division: (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c²+d²)
+ivec2 pbfc_div(ivec2 a, ivec2 b) {
+    int denom = pbf_add(pbf_mul(b.x, b.x), pbf_mul(b.y, b.y));
+    int nr = pbf_add(pbf_mul(a.x, b.x), pbf_mul(a.y, b.y));
+    int ni = pbf_sub(pbf_mul(a.y, b.x), pbf_mul(a.x, b.y));
+    return ivec2(pbf_div(nr, denom), pbf_div(ni, denom));
+}
+
+// |z|^2 via float decode, for escape test
+float pbfc_abs2(ivec2 z) {
+    vec2 zf = pbfc_decode(z);
+    return dot(zf, zf);
 }
 `;
 
@@ -467,7 +581,7 @@ const FRACTALS = [
   {
     id: 'mandelbrot',
     name: 'Mandelbrot',
-    desc: '<strong>Mandelbrot set</strong> — z² + c, c = pixel. SBP complex squaring via log-sum identity. Escape radius 2.',
+    desc: '<strong>Mandelbrot set</strong> — z² + c, c = pixel. Complex squaring via log-sum identity. Escape radius 2.',
     cx: -0.5, cy: 0, scale: 2.5,
     hasJulia: false,
     frag: (pal) => `
@@ -475,24 +589,23 @@ const FRACTALS = [
       uniform float u_scale;
       uniform int u_iter;
       uniform vec2 u_res;
-      ${SBP_GLSL}
+      ${PBF_GLSL}
       ${palGLSL(pal)}
       void main() {
         vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
         float re = u_center.x + uv.x * u_scale;
         float im = u_center.y + uv.y * u_scale;
-        vec4 c = sbp_complex(re, im);
-        vec4 z = c;
+        ivec2 c = pbfc_encode(re, im);
+        ivec2 z = c;
         float n = 0.0;
         for (int i = 0; i < 1024; i++) {
           if (i >= u_iter) break;
-          if (sbp_abs2(z) > 4.0) { n = float(i); break; }
-          z = sbp_sqr_add(z, c);
+          if (pbfc_abs2(z) > 4.0) { n = float(i); break; }
+          z = pbfc_sqr_add(z, c);
           n = float(i+1);
         }
         if (n >= float(u_iter)) { gl_FragColor = vec4(0,0,0,1); return; }
-        // smooth colouring
-        vec2 zf = sbp_to_float(z);
+        vec2 zf = pbfc_decode(z);
         float sl = n - log2(log2(dot(zf,zf))) + 4.0;
         gl_FragColor = vec4(palette(sl / float(u_iter)), 1.0);
       }
@@ -501,7 +614,7 @@ const FRACTALS = [
   {
     id: 'julia',
     name: 'Julia',
-    desc: '<strong>Julia set</strong> — z² + c, c = fixed seed. SBP squaring identical to Mandelbrot; seed swept via UI.',
+    desc: '<strong>Julia set</strong> — z² + c, c = fixed seed. Squaring identical to Mandelbrot; seed set via UI.',
     cx: 0, cy: 0, scale: 2.5,
     hasJulia: true,
     frag: (pal) => `
@@ -510,23 +623,23 @@ const FRACTALS = [
       uniform int u_iter;
       uniform vec2 u_res;
       uniform vec2 u_julia;
-      ${SBP_GLSL}
+      ${PBF_GLSL}
       ${palGLSL(pal)}
       void main() {
         vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
         float re = u_center.x + uv.x * u_scale;
         float im = u_center.y + uv.y * u_scale;
-        vec4 z = sbp_complex(re, im);
-        vec4 c = sbp_complex(u_julia.x, u_julia.y);
+        ivec2 z = pbfc_encode(re, im);
+        ivec2 c = pbfc_encode(u_julia.x, u_julia.y);
         float n = 0.0;
         for (int i = 0; i < 1024; i++) {
           if (i >= u_iter) break;
-          if (sbp_abs2(z) > 4.0) { n = float(i); break; }
-          z = sbp_sqr_add(z, c);
+          if (pbfc_abs2(z) > 4.0) { n = float(i); break; }
+          z = pbfc_sqr_add(z, c);
           n = float(i+1);
         }
         if (n >= float(u_iter)) { gl_FragColor = vec4(0,0,0,1); return; }
-        vec2 zf = sbp_to_float(z);
+        vec2 zf = pbfc_decode(z);
         float sl = n - log2(log2(dot(zf,zf))) + 4.0;
         gl_FragColor = vec4(palette(sl / float(u_iter)), 1.0);
       }
@@ -535,7 +648,7 @@ const FRACTALS = [
   {
     id: 'burning',
     name: 'Burning Ship',
-    desc: '<strong>Burning Ship</strong> — |Re(z)|+i|Im(z)|, squared then +c. SBP abs = sign reset (zero-gate in hardware).',
+    desc: '<strong>Burning Ship</strong> — |Re(z)|+i|Im(z)|, squared then +c. Absolute value is a sign flip in log space.',
     cx: -0.5, cy: -0.5, scale: 2.5,
     hasJulia: false,
     frag: (pal) => `
@@ -543,23 +656,23 @@ const FRACTALS = [
       uniform float u_scale;
       uniform int u_iter;
       uniform vec2 u_res;
-      ${SBP_GLSL}
+      ${PBF_GLSL}
       ${palGLSL(pal)}
       void main() {
         vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
         float re = u_center.x + uv.x * u_scale;
         float im = u_center.y + uv.y * u_scale;
-        vec4 c = sbp_complex(re, im);
-        vec4 z = c;
+        ivec2 c = pbfc_encode(re, im);
+        ivec2 z = c;
         float n = 0.0;
         for (int i = 0; i < 1024; i++) {
           if (i >= u_iter) break;
-          if (sbp_abs2(z) > 4.0) { n = float(i); break; }
-          z = sbp_burning_ship_step(z, c);
+          if (pbfc_abs2(z) > 4.0) { n = float(i); break; }
+          z = pbfc_burning(z, c);
           n = float(i+1);
         }
         if (n >= float(u_iter)) { gl_FragColor = vec4(0,0,0,1); return; }
-        vec2 zf = sbp_to_float(z);
+        vec2 zf = pbfc_decode(z);
         float sl = n - log2(log2(dot(zf,zf))) + 4.0;
         gl_FragColor = vec4(palette(sl / float(u_iter)), 1.0);
       }
@@ -568,7 +681,7 @@ const FRACTALS = [
   {
     id: 'tricorn',
     name: 'Tricorn',
-    desc: '<strong>Tricorn</strong> (Mandelbar) — z̄² + c. Conjugate before squaring. SBP negation of Im = NOT in hardware.',
+    desc: '<strong>Tricorn</strong> (Mandelbar) — z̄² + c. Conjugate flips the imaginary sign before squaring.',
     cx: 0, cy: 0, scale: 2.5,
     hasJulia: false,
     frag: (pal) => `
@@ -576,34 +689,34 @@ const FRACTALS = [
       uniform float u_scale;
       uniform int u_iter;
       uniform vec2 u_res;
-      ${SBP_GLSL}
+      ${PBF_GLSL}
       ${palGLSL(pal)}
       void main() {
         vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
         float re = u_center.x + uv.x * u_scale;
         float im = u_center.y + uv.y * u_scale;
-        vec4 c = sbp_complex(re, im);
-        vec4 z = c;
+        ivec2 c = pbfc_encode(re, im);
+        ivec2 z = c;
         float n = 0.0;
         for (int i = 0; i < 1024; i++) {
           if (i >= u_iter) break;
-          if (sbp_abs2(z) > 4.0) { n = float(i); break; }
-          // conjugate: negate Im (SBP: flip sign bit = NOT in hardware)
-          vec4 zc = vec4(z.x, z.y, z.z, -z.w);
-          z = sbp_sqr_add(zc, c);
+          if (pbfc_abs2(z) > 4.0) { n = float(i); break; }
+          // conjugate: negate the imaginary code
+          ivec2 zc = ivec2(z.x, pbf_neg(z.y));
+          z = pbfc_sqr_add(zc, c);
           n = float(i+1);
         }
         if (n >= float(u_iter)) { gl_FragColor = vec4(0,0,0,1); return; }
-        vec2 zf = sbp_to_float(z);
+        vec2 zf = pbfc_decode(z);
         float sl = n - log2(log2(dot(zf,zf))) + 4.0;
         gl_FragColor = vec4(palette(sl / float(u_iter)), 1.0);
       }
     `
   },
   {
-    id: 'lns_lyapunov',
-    name: 'LNS Lyapunov',
-    desc: '<strong>LNS Lyapunov</strong> — Lyapunov exponent computed entirely in log space. SBP addition of log-magnitude increments per orbit.',
+    id: 'lyapunov',
+    name: 'Lyapunov',
+    desc: '<strong>Lyapunov exponent</strong> — alternating logistic map with (a,b). log|deriv| is read directly off the PBF magnitude level; no log() is called in the loop.',
     cx: 0, cy: 0, scale: 2.5,
     hasJulia: false,
     frag: (pal) => `
@@ -611,7 +724,7 @@ const FRACTALS = [
       uniform float u_scale;
       uniform int u_iter;
       uniform vec2 u_res;
-      ${SBP_GLSL}
+      ${PBF_GLSL}
       ${palGLSL(pal)}
       void main() {
         vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
@@ -619,19 +732,31 @@ const FRACTALS = [
         float b = u_center.y + uv.y * u_scale * 2.0 + 3.0;
         a = clamp(a, 0.5, 4.0);
         b = clamp(b, 0.5, 4.0);
-        // Lyapunov: alternate logistic map with a and b
-        float x = 0.5;
-        float lam = 0.0;
+        int ac = pbf_encode(a);
+        int bc = pbf_encode(b);
+        int xc = pbf_encode(0.5);
+        // Accumulate log-magnitude levels as integers; convert once at the end.
+        int lvl_sum = 0;
+        float lvl_corr = 0.0;   // for zero-deriv sentinel
         for (int i = 0; i < 1024; i++) {
           if (i >= u_iter) break;
-          float r = mod(float(i), 2.0) < 1.0 ? a : b;
-          x = r * x * (1.0 - x);
-          // derivative |r*(1-2x)| — log via SBP
-          float deriv = abs(r * (1.0 - 2.0*x));
-          // accumulate log in SBP: just sum log2(deriv)
-          lam += (deriv > 1e-10) ? log2(deriv) : -30.0;
+          int rc = (mod(float(i), 2.0) < 1.0) ? ac : bc;
+          int one_minus_x = pbf_sub(u_pbf_one, xc);
+          xc = pbf_mul(pbf_mul(rc, xc), one_minus_x);
+          // Quantization can push xc outside [0, 1]; clamp in PBF.
+          if (xc != 0 && xc < PBF_MID)       xc = 0;            // went negative
+          else if (xc >= PBF_MID && xc > u_pbf_one) xc = u_pbf_one; // > 1
+          // deriv = r * (1 - 2x)
+          int two_x   = pbf_mul(u_pbf_two, xc);
+          int d_fact  = pbf_sub(u_pbf_one, two_x);
+          int deriv   = pbf_mul(rc, d_fact);
+          int adv     = pbf_abs(deriv);
+          if (adv == 0)      lvl_corr += -30.0;
+          else               lvl_sum  += (adv - PBF_MID) + u_offset;
         }
-        lam /= float(u_iter);
+        // total ln|deriv| ≈ lvl_sum * u_ln_per_level; convert to log2 and average
+        float lam = (float(lvl_sum) * u_ln_per_level / 0.6931472 + lvl_corr)
+                    / float(u_iter);
         if (lam < 0.0) {
           // stable: map negative lam to colour
           float t = clamp(-lam / 4.0, 0.0, 1.0);
@@ -647,7 +772,7 @@ const FRACTALS = [
   {
     id: 'newton',
     name: 'Newton',
-    desc: '<strong>Newton z³−1</strong> — root-finding via Newton\'s method. SBP division = log subtraction. Each root basin coloured.',
+    desc: '<strong>Newton z³−1</strong> — root-finding via Newton\'s method. Every iteration uses pbfc_sqr, pbfc_mul, pbfc_div, pbfc_sub. PBF16 recommended; PBF8 is far too coarse.',
     cx: 0, cy: 0, scale: 1.5,
     hasJulia: false,
     frag: (pal) => `
@@ -655,37 +780,35 @@ const FRACTALS = [
       uniform float u_scale;
       uniform int u_iter;
       uniform vec2 u_res;
-      ${SBP_GLSL}
+      ${PBF_GLSL}
       void main() {
         vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
         float re = u_center.x + uv.x * u_scale;
         float im = u_center.y + uv.y * u_scale;
-        vec2 z = vec2(re, im);
-        // Newton's method for z^3 = 1 using SBP-style log arithmetic via float
-        // z_n+1 = z_n - f(z)/f'(z) = (2z^3+1)/(3z^2)
+        ivec2 z = pbfc_encode(re, im);
+        // Roots of z^3 = 1
+        ivec2 root0 = pbfc_encode( 1.0,  0.0);
+        ivec2 root1 = pbfc_encode(-0.5,  0.866025);
+        ivec2 root2 = pbfc_encode(-0.5, -0.866025);
         float n = 0.0;
         int root = 0;
         for (int i = 0; i < 1024; i++) {
           if (i >= u_iter) break;
-          // z^2 in log: re^2-im^2, 2*re*im
-          float re2 = z.x*z.x - z.y*z.y;
-          float im2 = 2.0*z.x*z.y;
-          // z^3 = z^2 * z
-          float re3 = re2*z.x - im2*z.y;
-          float im3 = re2*z.y + im2*z.x;
-          // denom = 3*z^2
-          float dr = 3.0*re2, di = 3.0*im2;
-          float denom = dr*dr + di*di;
-          if (denom < 1e-14) break;
-          // num = 2*z^3 + 1
-          float nr = 2.0*re3 + 1.0, ni = 2.0*im3;
-          // z -= num/denom_complex
-          z.x -= (nr*dr + ni*di) / denom;
-          z.y -= (ni*dr - nr*di) / denom;
-          // check convergence
-          float d0 = length(z - vec2(1,0));
-          float d1 = length(z - vec2(-0.5, 0.866025));
-          float d2 = length(z - vec2(-0.5,-0.866025));
+          // z² and z³ = z²·z
+          ivec2 z2 = pbfc_sqr(z);
+          ivec2 z3 = pbfc_mul(z2, z);
+          // num = 2·z³ + 1
+          ivec2 num = ivec2(pbf_add(pbf_mul(u_pbf_two, z3.x), u_pbf_one),
+                            pbf_mul(u_pbf_two, z3.y));
+          // den = 3·z²
+          ivec2 den = ivec2(pbf_mul(u_pbf_three, z2.x),
+                            pbf_mul(u_pbf_three, z2.y));
+          // z ← z − num/den
+          z = pbfc_sub(z, pbfc_div(num, den));
+          // root convergence
+          float d0 = pbfc_abs2(pbfc_sub(z, root0));
+          float d1 = pbfc_abs2(pbfc_sub(z, root1));
+          float d2 = pbfc_abs2(pbfc_sub(z, root2));
           if (d0 < 1e-4 || d1 < 1e-4 || d2 < 1e-4) {
             root = (d0 < d1 && d0 < d2) ? 0 : (d1 < d2) ? 1 : 2;
             n = float(i);
@@ -694,18 +817,18 @@ const FRACTALS = [
           n = float(i+1);
         }
         float speed = 1.0 - n / float(u_iter);
-        vec3 cols[3];
-        cols[0] = vec3(0.9, 0.3, 0.1);
-        cols[1] = vec3(0.1, 0.7, 0.4);
-        cols[2] = vec3(0.1, 0.4, 0.9);
-        gl_FragColor = vec4(cols[root] * (0.2 + 0.8*speed), 1.0);
+        vec3 col;
+        if      (root == 0) col = vec3(0.9, 0.3, 0.1);
+        else if (root == 1) col = vec3(0.1, 0.7, 0.4);
+        else                col = vec3(0.1, 0.4, 0.9);
+        gl_FragColor = vec4(col * (0.2 + 0.8*speed), 1.0);
       }
     `
   },
   {
-    id: 'sbp_landscape',
-    name: 'SBP Mirror',
-    desc: '<strong>SBP Mirror fractal</strong> — exploits NOT(z)=−z. At each step, if |z|>1, replace z with its SBP mirror: z ← NOT(z)/|z|². Creates a reflection fractal unique to SBP encoding.',
+    id: 'log_mirror',
+    name: 'Log Mirror',
+    desc: '<strong>Log Mirror</strong> — Mandelbrot variant. When |z|>1 the point is inverted through the unit circle (z → z / |z|²) using pbf_mul, pbf_add, pbf_div, then squared + c.',
     cx: 0, cy: 0, scale: 2.0,
     hasJulia: false,
     frag: (pal) => `
@@ -713,28 +836,27 @@ const FRACTALS = [
       uniform float u_scale;
       uniform int u_iter;
       uniform vec2 u_res;
-      ${SBP_GLSL}
+      ${PBF_GLSL}
       ${palGLSL(pal)}
       void main() {
         vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * vec2(u_res.x/u_res.y, 1.0);
         float re = u_center.x + uv.x * u_scale;
         float im = u_center.y + uv.y * u_scale;
-        vec4 c = sbp_complex(re, im);
-        vec4 z = c;
+        ivec2 c = pbfc_encode(re, im);
+        ivec2 z = c;
         float n = 0.0;
         float orbit = 0.0;
         for (int i = 0; i < 1024; i++) {
           if (i >= u_iter) break;
-          float r2 = sbp_abs2(z);
+          float r2 = pbfc_abs2(z);
           orbit += r2;
           if (r2 > 64.0) { n = float(i); break; }
-          // SBP mirror step: negate both components (NOT = neg in SBP)
-          // then z = sqr(z) + c
+          // Circle inversion: z → z / |z|²  when |z|>1
           if (r2 > 1.0) {
-            // reflect: negate im (SBP NOT on Im channel = conjugate)
-            z = vec4(z.x, z.y, z.z, -z.w);
+            int r2_pbf = pbf_add(pbf_mul(z.x, z.x), pbf_mul(z.y, z.y));
+            z = ivec2(pbf_div(z.x, r2_pbf), pbf_div(z.y, r2_pbf));
           }
-          z = sbp_sqr_add(z, c);
+          z = pbfc_sqr_add(z, c);
           n = float(i+1);
         }
         if (n >= float(u_iter)) {
@@ -850,6 +972,15 @@ class FractalGL {
     set('u_res', this.canvas.width, this.canvas.height);
     setI('u_iter', iter);
     if (julia) set('u_julia', julia[0], julia[1]);
+    set('u_ln_per_level', currentFormat.ln_per_level);
+    set('u_vmin', currentFormat.v_min);
+    setI('u_offset', currentFormat.offset);
+    setI('u_pbf_one',   currentFormat.pbf_one);
+    setI('u_pbf_two',   currentFormat.pbf_two);
+    setI('u_pbf_three', currentFormat.pbf_three);
+    setI('PBF_MID', currentFormat.mid);
+    setI('PBF_MAX', currentFormat.max_code);
+    setI('PBF_LEVELS', currentFormat.n_levels);
 
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -860,7 +991,8 @@ class FractalGL {
 // APP
 // ══════════════════════════════════════════════════════════════════════════════
 
-let fractalIdx = 0;
+let fractalIdx = FRACTALS.findIndex(f => f.id === 'log_mirror');
+if (fractalIdx < 0) fractalIdx = 0;
 let palIdx = 0;
 let cx, cy, scale;
 let iter = 256;
@@ -931,7 +1063,7 @@ function buildTabs() {
   const el = document.getElementById('tabs');
   FRACTALS.forEach((f, i) => {
     const btn = document.createElement('button');
-    btn.className = 'tab' + (i === 0 ? ' active' : '');
+    btn.className = 'tab' + (i === fractalIdx ? ' active' : '');
     btn.textContent = f.name;
     btn.onclick = () => {
       fractalIdx = i;
@@ -1064,6 +1196,18 @@ function setupControls() {
     jIm.value = juliaIm;
     scheduleRender();
   };
+
+  document.querySelectorAll('.format-btn').forEach(b => {
+    b.onclick = () => {
+      const bits = parseInt(b.dataset.bits);
+      currentFormat = (bits === 16) ? PBF16 : PBF8;
+      document.querySelectorAll('.format-btn').forEach(x =>
+        x.classList.toggle('active', x === b));
+      document.getElementById('formatBadge').innerHTML =
+        `arithmetic: <strong>PBF${bits}</strong> (int mul/div, softplus add)`;
+      scheduleRender();
+    };
+  });
 }
 
 // ── init ──
@@ -1076,6 +1220,8 @@ window.addEventListener('load', () => {
 
   const f = currentFractal();
   document.getElementById('fractalDesc').innerHTML = f.desc;
+  document.getElementById('juliaControls').style.display =
+    f.hasJulia ? 'block' : 'none';
   cx = f.cx; cy = f.cy; scale = f.scale;
 
   window.addEventListener('resize', () => { resize(); });
