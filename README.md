@@ -2,7 +2,8 @@
 
 Logarithmic number system (LNS) arithmetic in C++.
 
-In an LNS, each number is stored as `(sign, log₂|x|)`:
+An LNS stores each number by the log of its magnitude. Arithmetic works
+on the log:
 
 - **Mul / div**: add / subtract the log fields — a single integer adder
   of width `n_bits`.
@@ -10,12 +11,18 @@ In an LNS, each number is stored as `(sign, log₂|x|)`:
   `log(a ± b) = log|a| + f(log|a| − log|b|)` where `f = sb` for
   same-sign addition and `f = db` for opposite-sign.
 
-Traditional LNS implementations store `sb` and `db` as ROMs. **PBF is
-the table-free variant**: both functions are evaluated exactly in Q32
-fixed-point by a closed-form continued fraction — no lookup table and no
-approximation beyond the Q32 rounding itself. Because the same Q32 CF
-engine handles every bit width, the format is parameterizable at
-runtime: PBF4, PBF8, PBF16, and any custom
+PBF has two defining properties that distinguish it from traditional LNS
+(`xlns16`, bfloat16-style):
+
+- **Sign-By-Position encoding**. No sign bit. Sign lives in where the
+  code sits relative to the midpoint, so negation is `max_code − a`
+  (ones' complement) and integer comparison matches value comparison.
+- **Table-free `sb` / `db`**. Both Gauss log functions are evaluated
+  exactly in Q32 fixed-point by a closed-form continued fraction — no
+  ROM and no approximation beyond the Q32 rounding itself.
+
+Because the same Q32 CF engine handles every bit width, the format is
+parameterizable at runtime: PBF4, PBF8, PBF16, and any custom
 `pbf_init(&p, n_bits, v_min, v_max)` share one engine.
 
 Trade-off vs float: you replace the mantissa multiplier with an integer
@@ -127,14 +134,30 @@ build/pbf_xlns_test     # xlns16 API shim verification
 
 ## PBF format
 
-A PBF code is an unsigned integer in `[0, 2ⁿ − 1]`:
+A PBF code is an unsigned integer in `[0, 2ⁿ − 1]` using **Sign-By-Position
+(SBP) encoding** — there is no dedicated sign bit. The sign of a value
+is determined entirely by where its code sits relative to the midpoint:
 
 ```
 code == 0            → zero
-code == max_code     → infinity
 code <  mid          → negative (magnitude grows as code decreases)
 code >= mid          → positive (magnitude grows as code increases)
+code == max_code     → infinity
 ```
+
+Consequences:
+
+- **Negation is ones' complement** within the format range:
+  `pbf_neg(a) = max_code − a`. No sign bit to flip, no XOR, no separate
+  zero handling (zero and infinity are the fixed points).
+- **Comparison is integer comparison** — `a < b` on codes matches the
+  mathematical `decode(a) < decode(b)` everywhere except the
+  0 / +inf sentinels.
+- **No ±0 ambiguity** — zero has a single representation.
+
+Contrast with traditional LNS (`xlns16`, bfloat16): those use a dedicated
+sign bit plus a log-magnitude field, so negation flips one bit and
+comparison needs a canonical remap.
 
 The format descriptor `pbf_t` holds `n_bits`, `v_min`, `v_max`, and
 precomputed `scale` / `offset` values. Presets `pbf4_init`, `pbf8_init`,
