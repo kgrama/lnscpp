@@ -175,17 +175,21 @@ static void pbf_init(pbf_t* p, int n_bits, double v_min, double v_max) {
     p->mid      = (uint32_t)1 << (n_bits - 1);
     p->n_levels = (int32_t)p->mid - 1;
 
-    // ln_range = ln(v_max/v_min) in Q format, via CF
-    double ratio_d = v_max / v_min;
-    __int128 ratio_q = (__int128)(ratio_d * (double)PBF_Q);
-    int64_t ln_range = pbf_ln_cf_big(ratio_q);
+    // Init constants are computed in double then converted to Q32. The CF
+    // path is lossy here: representing tiny v_min in Q32 truncates to a few
+    // significant digits (1e-8*Q rounds to 42, ≈2% off), and pbf_ln_cf_big
+    // accumulates O(k) LSB error from k * PBF_LN2 at large arguments.
+    // Runtime arithmetic still uses the CF — only the one-shot init constants
+    // go through libm.
+    double ln_vmin_d = std::log(v_min);
+    double ln_vmax_d = std::log(v_max);
+    int64_t ln_range = (int64_t)std::llround((ln_vmax_d - ln_vmin_d) * (double)PBF_Q);
+    int64_t ln_vmin  = (int64_t)std::llround(ln_vmin_d * (double)PBF_Q);
 
     // scale = ln_range // n_levels (Python floor division)
     p->scale = pbf_floordiv(ln_range, (int64_t)p->n_levels);
 
     // offset = round(ln(v_min) / scale), used by mul/div
-    __int128 vmin_q = (__int128)(v_min * (double)PBF_Q);
-    int64_t  ln_vmin = pbf_ln_cf_big(vmin_q);
     p->offset = (p->scale != 0) ? pbf_kdiv(ln_vmin, p->scale) : 0;
 }
 

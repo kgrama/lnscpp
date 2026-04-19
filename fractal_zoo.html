@@ -299,7 +299,7 @@
 <header>
   <div class="logo">FRACTAL<span>ZOO</span></div>
   <div class="fractal-tabs" id="tabs"></div>
-  <div class="info-badge" id="formatBadge">arithmetic: <strong>PBF8</strong> (int mul/div, softplus add)</div>
+  <div class="info-badge" id="formatBadge">arithmetic: <strong>PBF8 — int mul/div, int Q13 CF for sb/db</strong></div>
 </header>
 
 <div class="main">
@@ -337,8 +337,12 @@
     <div class="sidebar-section">
       <div class="sidebar-label">Format</div>
       <div class="format-row" id="formats">
-        <button class="btn format-btn active" data-bits="8">PBF8</button>
-        <button class="btn format-btn" data-bits="16">PBF16</button>
+        <button class="btn format-btn active" data-fmt="pbf8">PBF8</button>
+        <button class="btn format-btn"        data-fmt="pbf16">PBF16</button>
+      </div>
+      <div class="format-row" style="margin-top:6px">
+        <button class="btn format-btn" data-fmt="tap8">TAP-PBF8</button>
+        <button class="btn format-btn" data-fmt="tap16">TAP-PBF16</button>
       </div>
     </div>
 
@@ -380,6 +384,8 @@ function makePbf(n_bits, v_min, v_max) {
   const max_code     = (1 << n_bits) - 1;
   const ln_per_level = Math.log(v_max / v_min) / n_levels;
   const offset       = Math.round(Math.log(v_min) / ln_per_level);
+  // Q13 form of ln_per_level — used by the GPU's int CF for sb/db.
+  const base_step_log_q13 = Math.max(1, Math.round(ln_per_level * 8192));
 
   const encode = (v) => {
     if (v === 0) return 0;
@@ -393,16 +399,126 @@ function makePbf(n_bits, v_min, v_max) {
   };
 
   return {
-    n_bits, v_min, v_max, mid, n_levels, max_code, ln_per_level, offset,
+    n_bits, v_min, v_max, mid, n_levels, max_code,
+    ln_per_level, offset, base_step_log_q13,
+    is_taper: false,
     pbf_one:   encode(1.0),
     pbf_two:   encode(2.0),
     pbf_three: encode(3.0),
+    pbf_four:  encode(4.0),
     encode,
   };
 }
 
 const PBF8  = makePbf(8,  1e-4, 1e4);
 const PBF16 = makePbf(16, 1e-8, 1e8);
+
+// ── Tapered PBF (mirrors pbf_taper.cpp). 4 tapers with step ratios 8:1:1:8 ──
+// — denser around |x|=1.0. W16 boundaries match proofs/P32_Taper.v exactly.
+//
+// Uses an integer "position" coordinate: each magnitude code takes 1 or 8
+// position units depending on its taper. Mul/div on tapered codes is then a
+// pure integer add/sub on positions:
+//     pos(a*b) = pos(a) + pos(b) − unity_pos
+// matching the flat path's `am + bm + offset` shape.
+function makeTaperedPbf(n_bits, v_max) {
+  const mid       = 1 << (n_bits - 1);
+  const max_code  = (1 << n_bits) - 1;
+  const max_mag   = mid - 2;
+
+  let taper_mag_end;
+  if (n_bits === 16) {
+    taper_mag_end = [8191, 16382, 24573, 32766];
+  } else {
+    const per = (max_mag / 4) | 0;
+    taper_mag_end = [per - 1, 2*per - 1, 3*per - 1, max_mag];
+  }
+
+  const taper_step = [8, 1, 1, 8];   // base position units per code in each taper
+
+  // Cumulative position at end of each taper. Position 0 = magnitude code 0.
+  // Within taper k, each successive code adds taper_step[k] positions.
+  const taper_pos_end = [];
+  let pos = 0, prev_mag = 0;
+  for (let k = 0; k < 4; k++) {
+    pos += (taper_mag_end[k] - prev_mag) * taper_step[k];
+    taper_pos_end.push(pos);
+    prev_mag = taper_mag_end[k];
+  }
+  const max_pos = taper_pos_end[3];
+
+  // unity_pos = position where log = 0. Total log span = 2*ln(v_max), so unity
+  // sits at the geometric centre of position space.
+  const unity_pos = max_pos >> 1;
+
+  // Pre-compute per-taper start positions (for fast pos→mag lookup).
+  const taper_pos_start = [0];
+  for (let k = 1; k < 4; k++) taper_pos_start.push(taper_pos_end[k-1] + taper_step[k]);
+
+  // Q13 fixed-point: matches the GPU CF's Q-format exactly so log values can
+  // be passed verbatim to the int sb/db evaluator on the GPU.
+  const Q13 = 8192;
+  // base_step_log_q13 = log per position unit, in Q13. Used for the sb/db CF
+  // input: d_q13 = (pos_diff) * base_step_log_q13.
+  const base_step_log_q13 = Math.round(2 * Math.log(v_max) / max_pos * Q13);
+
+  const magToPos = (mag) => {
+    const k = mag <= taper_mag_end[0] ? 0
+            : mag <= taper_mag_end[1] ? 1
+            : mag <= taper_mag_end[2] ? 2 : 3;
+    const base_mag = k === 0 ? 0 : taper_mag_end[k-1] + 1;
+    const base_pos = k === 0 ? 0 : taper_pos_start[k];
+    return base_pos + (mag - base_mag) * taper_step[k];
+  };
+
+  const posToMag = (p) => {
+    if (p <= 0)        return 0;
+    if (p >= max_pos)  return max_mag;
+    const k = p <= taper_pos_end[0] ? 0
+            : p <= taper_pos_end[1] ? 1
+            : p <= taper_pos_end[2] ? 2 : 3;
+    const base_mag = k === 0 ? 0 : taper_mag_end[k-1] + 1;
+    const base_pos = k === 0 ? 0 : taper_pos_start[k];
+    const step = taper_step[k];
+    return base_mag + (((p - base_pos) + (step >> 1)) / step | 0);
+  };
+
+  const encode = (v) => {
+    if (v === 0) return 0;
+    let a = Math.abs(v);
+    if (a > v_max) a = v_max;
+    if (a < 1.0/v_max) a = 1.0/v_max;
+    // Position from log: pos = unity_pos + round(log_v / base_step_log)
+    const log_q13 = Math.round(Math.log(a) * Q13);
+    const p = unity_pos + Math.round(log_q13 / base_step_log_q13);
+    const mag = posToMag(p);
+    return v > 0 ? mid + mag : mid - 1 - mag;
+  };
+
+  return {
+    n_bits, v_min: 1.0/v_max, v_max,
+    mid, n_levels: max_mag + 1, max_code,
+    is_taper: true,
+    // Uniform payload (all int)
+    taper_mag_end:   new Int32Array(taper_mag_end),
+    taper_pos_end:   new Int32Array(taper_pos_end),
+    taper_pos_start: new Int32Array(taper_pos_start),
+    taper_step:      new Int32Array(taper_step),
+    unity_pos, max_pos, base_step_log_q13,
+    pbf_one:   encode(1.0),
+    pbf_two:   encode(2.0),
+    pbf_three: encode(3.0),
+    pbf_four:  encode(4.0),
+    encode,
+    // legacy fields for shader uniforms when flat (zero for tapered)
+    ln_per_level: 1.0,
+    offset: 0,
+  };
+}
+
+const TAP8  = makeTaperedPbf(8,  1e4);
+const TAP16 = makeTaperedPbf(16, 1e8);
+
 let currentFormat = PBF8;
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -418,12 +534,35 @@ const PBF_GLSL = `
 uniform int   PBF_MID;         // 1 << (n_bits - 1)
 uniform int   PBF_MAX;         // (1 << n_bits) - 1, infinity sentinel
 uniform int   PBF_LEVELS;      // mid - 1
-uniform float u_ln_per_level;  // ln(v_max/v_min) / n_levels
-uniform float u_vmin;
-uniform int   u_offset;        // precomputed round(ln(v_min) / scale_ln)
+uniform float u_ln_per_level;  // ln(v_max/v_min) / n_levels  (flat path)
+uniform float u_vmin;          // (flat path)
+uniform int   u_offset;        // precomputed round(ln(v_min) / scale_ln) (flat)
 uniform int   u_pbf_one;       // pbf_encode(1.0)
 uniform int   u_pbf_two;       // pbf_encode(2.0)
 uniform int   u_pbf_three;     // pbf_encode(3.0)
+
+// ── Tapered PBF parameters (used when u_format_kind == 1) ───────────────────
+// Position units: each magnitude code costs 1 or 8 base units, depending on
+// its taper. unity_pos is the position where log(value) = 0. Mul/div on
+// tapered codes is then a pure integer add/sub on positions.
+uniform int u_format_kind;        // 0 = flat, 1 = tapered
+uniform int u_taper_mag_end[4];   // inclusive end of each taper (mag code units)
+uniform int u_taper_pos_end[4];   // cumulative position at end of each taper
+uniform int u_taper_pos_start[4]; // first position in each taper (k>0)
+uniform int u_taper_step[4];      // base position units per code in this taper
+uniform int u_unity_pos;          // position at log = 0
+uniform int u_max_pos;            // position at largest magnitude code
+
+// ── Integer Q13 CF state ────────────────────────────────────────────────────
+// Q13 is the largest Q-format that fits the muldiv 16*x*Q worst case in
+// signed int32 (16 * 2^13 * 2^13 = 2^30 < 2^31). The CPU PBF uses Q32
+// (needs int64); Q13 is the GPU equivalent — same algorithm, narrower mantissa.
+const int PBF_Q   = 8192;          // 1 << 13
+const int PBF_LN2 = 5680;          // round(ln(2) * 8192)
+
+// Q13 log per tapered position unit (used to convert position differences
+// into the Q13 d the sb/db CF expects). Set from JS.
+uniform int u_base_step_log_q13;
 
 // ── Primitives ──────────────────────────────────────────────────────────────
 
@@ -437,16 +576,144 @@ int pbf_abs(int a) {
     return pbf_neg(a);
 }
 
+// ── Tapered position helpers (only used when u_format_kind == 1) ────────────
+
+// GLSL ES 1.0 requires constant array indices, so the per-taper branches
+// are unrolled. Logic identical to pbf_taper.cpp's piecewise lookup.
+int pbft_mag_to_pos(int mag) {
+    if (mag <= u_taper_mag_end[0])
+        return mag * u_taper_step[0];
+    if (mag <= u_taper_mag_end[1])
+        return u_taper_pos_start[1] + (mag - u_taper_mag_end[0] - 1) * u_taper_step[1];
+    if (mag <= u_taper_mag_end[2])
+        return u_taper_pos_start[2] + (mag - u_taper_mag_end[1] - 1) * u_taper_step[2];
+    return     u_taper_pos_start[3] + (mag - u_taper_mag_end[2] - 1) * u_taper_step[3];
+}
+
+int pbft_pos_to_mag(int p) {
+    if (p <= 0)         return 0;
+    if (p >= u_max_pos) return PBF_LEVELS - 1;
+    if (p <= u_taper_pos_end[0])
+        return (p + (u_taper_step[0] / 2)) / u_taper_step[0];
+    if (p <= u_taper_pos_end[1])
+        return (u_taper_mag_end[0] + 1) + (p - u_taper_pos_start[1]);
+    if (p <= u_taper_pos_end[2])
+        return (u_taper_mag_end[1] + 1) + (p - u_taper_pos_start[2]);
+    return     (u_taper_mag_end[2] + 1)
+             + ((p - u_taper_pos_start[3]) + (u_taper_step[3] / 2)) / u_taper_step[3];
+}
+
+// ── Integer Q13 continued fractions (mirrors pbf.cpp, narrower mantissa) ────
+
+int pbf_kdiv(int a, int b) {
+    if (b == 0) return a;
+    int b_half = b / 2;
+    int num    = (b > 0) ? (a + b_half) : (a - b_half);
+    return num / b;
+}
+
+// Round-to-nearest a*b/c. Caller must ensure a*b fits in int32 (true for
+// every CF call here: |a*b| ≤ 16*Q*Q = 2^30).
+int pbf_muldiv(int a, int b, int c) {
+    if (c == 0) return a;
+    int prod  = a * b;
+    int chalf = (c > 0) ? (c / 2) : -((-c) / 2);
+    int num   = (c > 0) ? (prod + chalf) : (prod - chalf);
+    return num / c;
+}
+
+// ln(1 + x/Q) * Q via 8-term continued fraction.
+int pbf_ln1p_cf(int x) {
+    if (x == 0)        return 0;
+    if (x <= -PBF_Q)   return -PBF_Q * 100;
+    int h = 8 * PBF_Q;
+    h = 7 * PBF_Q + pbf_muldiv(16 * x, PBF_Q, h);
+    h = 6 * PBF_Q + pbf_muldiv( 9 * x, PBF_Q, h);
+    h = 5 * PBF_Q + pbf_muldiv( 9 * x, PBF_Q, h);
+    h = 4 * PBF_Q + pbf_muldiv( 4 * x, PBF_Q, h);
+    h = 3 * PBF_Q + pbf_muldiv( 4 * x, PBF_Q, h);
+    h = 2 * PBF_Q + pbf_muldiv(     x, PBF_Q, h);
+    h = 1 * PBF_Q + pbf_muldiv(     x, PBF_Q, h);
+    return pbf_muldiv(x, PBF_Q, h);
+}
+
+// (exp(x/Q) - 1) * Q via 7-term continued fraction.
+int pbf_expm1_cf(int x) {
+    if (x == 0) return 0;
+    if (x >  10 * PBF_Q) return PBF_Q * 16384;     // saturate; PBF_Q*1<<20 overflows int32
+    if (x < -10 * PBF_Q) return -PBF_Q;
+    int h = 2 * PBF_Q;
+    h = 7 * PBF_Q + pbf_muldiv(-x, PBF_Q, h);
+    h = 2 * PBF_Q + pbf_muldiv( x, PBF_Q, h);
+    h = 5 * PBF_Q + pbf_muldiv(-x, PBF_Q, h);
+    h = 2 * PBF_Q + pbf_muldiv( x, PBF_Q, h);
+    h = 3 * PBF_Q + pbf_muldiv(-x, PBF_Q, h);
+    h = 2 * PBF_Q + pbf_muldiv( x, PBF_Q, h);
+    h = 1 * PBF_Q + pbf_muldiv(-x, PBF_Q, h);
+    return pbf_muldiv(x, PBF_Q, h);
+}
+
+// exp(x/Q) * Q with ln2 range reduction. x in Q-format.
+int pbf_exp_cf(int x) {
+    if (x == 0) return PBF_Q;
+    int k = pbf_kdiv(x, PBF_LN2);
+    int r = x - k * PBF_LN2;
+    int er = PBF_Q + pbf_expm1_cf(r);
+    if (k >= 0) {
+        if (k >= 16) return PBF_Q * 16384;          // saturate
+        // shift left by k (multiply by 2^k); check headroom
+        for (int i = 0; i < 16; i++) { if (i >= k) break; er = er * 2; }
+        return er;
+    }
+    int nk = -k;
+    if (nk >= 31) return 0;
+    for (int i = 0; i < 31; i++) { if (i >= nk) break; er = er / 2; }
+    return er;
+}
+
+// ln(1 + exp(d/Q)) * Q — softplus.
+int pbf_softplus_cf(int d) {
+    if (d >  10 * PBF_Q) return d;
+    if (d < -10 * PBF_Q) return pbf_exp_cf(d);
+    if (d > 0) {
+        int e = pbf_exp_cf(-d);
+        return d + pbf_ln1p_cf(e);
+    }
+    int e = pbf_exp_cf(d);
+    return pbf_ln1p_cf(e);
+}
+
+// ln(1 - exp(d/Q)) * Q — softminus, d < 0.
+int pbf_softminus_cf(int d) {
+    if (d >= 0)          return -100 * PBF_Q;
+    if (d < -10 * PBF_Q) return -pbf_exp_cf(d);
+    int e = pbf_exp_cf(d);
+    return pbf_ln1p_cf(-e);
+}
+
+// Encode: float input at the pixel boundary; everything inside the iteration
+// is int. The float→int conversion via log() happens once per pixel (for the
+// c constant), not inside the loop.
 int pbf_encode(float v) {
     if (v == 0.0) return 0;
     float mag = abs(v);
-    if (mag < u_vmin) mag = u_vmin;
-    int level = int(floor(log(mag / u_vmin) / u_ln_per_level + 0.5));
-    if (level < 0) level = 0;
-    if (level > PBF_LEVELS - 1) level = PBF_LEVELS - 1;
+    int level;
+    if (u_format_kind == 1) {
+        // Tapered: convert log to Q13, then to position, then to magnitude code.
+        int log_q13 = int(floor(log(mag) * float(PBF_Q) + 0.5));
+        int p = u_unity_pos + pbf_kdiv(log_q13, u_base_step_log_q13);
+        level = pbft_pos_to_mag(p);
+    } else {
+        if (mag < u_vmin) mag = u_vmin;
+        level = int(floor(log(mag / u_vmin) / u_ln_per_level + 0.5));
+        if (level < 0) level = 0;
+        if (level > PBF_LEVELS - 1) level = PBF_LEVELS - 1;
+    }
     return (v > 0.0) ? (PBF_MID + level) : (PBF_MID - 1 - level);
 }
 
+// Decode: float output for the post-iteration colour computation. Inside the
+// iteration we use pure-int compares and never call this.
 float pbf_decode(int code) {
     if (code == 0)       return 0.0;
     if (code == PBF_MAX) return 1e30;
@@ -454,10 +721,16 @@ float pbf_decode(int code) {
     int lvl;
     if (code >= PBF_MID) { s =  1.0; lvl = code - PBF_MID; }
     else                 { s = -1.0; lvl = PBF_MID - 1 - code; }
+    if (u_format_kind == 1) {
+        int p = pbft_mag_to_pos(lvl);
+        int log_q13 = (p - u_unity_pos) * u_base_step_log_q13;
+        return s * exp(float(log_q13) / float(PBF_Q));
+    }
     return s * u_vmin * exp(float(lvl) * u_ln_per_level);
 }
 
-// Multiplication: pure integer adds on magnitude levels.
+// Multiplication: pure integer adds on magnitude levels (flat) or on
+// tapered positions. Both paths are int-only.
 int pbf_mul(int a, int b) {
     if (a == 0 || b == 0) return 0;
     if (a == PBF_MAX || b == PBF_MAX) return PBF_MAX;
@@ -465,9 +738,14 @@ int pbf_mul(int a, int b) {
     int bn = (b < PBF_MID) ? 1 : 0;
     int am = (an == 1) ? (PBF_MID - 1 - a) : (a - PBF_MID);
     int bm = (bn == 1) ? (PBF_MID - 1 - b) : (b - PBF_MID);
-    int cm = am + bm + u_offset;
-    if (cm < 0)           return 0;
-    if (cm >= PBF_LEVELS) return PBF_MAX;
+    int cm;
+    if (u_format_kind == 1) {
+        cm = pbft_pos_to_mag(pbft_mag_to_pos(am) + pbft_mag_to_pos(bm) - u_unity_pos);
+    } else {
+        cm = am + bm + u_offset;
+        if (cm < 0)           return 0;
+        if (cm >= PBF_LEVELS) return PBF_MAX;
+    }
     int cn = an + bn - 2 * an * bn;  // XOR on 0/1
     return (cn == 1) ? (PBF_MID - 1 - cm) : (PBF_MID + cm);
 }
@@ -480,14 +758,25 @@ int pbf_div(int a, int b) {
     int bn = (b < PBF_MID) ? 1 : 0;
     int am = (an == 1) ? (PBF_MID - 1 - a) : (a - PBF_MID);
     int bm = (bn == 1) ? (PBF_MID - 1 - b) : (b - PBF_MID);
-    int cm = am - bm - u_offset;
-    if (cm < 0)           return 0;
-    if (cm >= PBF_LEVELS) return PBF_MAX;
+    int cm;
+    if (u_format_kind == 1) {
+        cm = pbft_pos_to_mag(pbft_mag_to_pos(am) - pbft_mag_to_pos(bm) + u_unity_pos);
+    } else {
+        cm = am - bm - u_offset;
+        if (cm < 0)           return 0;
+        if (cm >= PBF_LEVELS) return PBF_MAX;
+    }
     int cn = an + bn - 2 * an * bn;
     return (cn == 1) ? (PBF_MID - 1 - cm) : (PBF_MID + cm);
 }
 
-// Addition: softplus on same sign, softminus on opposite.
+// Addition: integer Q13 softplus / softminus CF on both flat and tapered
+// paths. The "log step per coordinate unit" uniform converts position
+// differences into the d the CF expects, and back into coordinate units
+// after the correction. No floats in the path.
+//
+// Coordinates: flat path uses magnitude code levels directly; tapered path
+// uses the per-taper position scheme from pbft_mag_to_pos.
 int pbf_add(int a, int b) {
     if (a == 0) return b;
     if (b == 0) return a;
@@ -496,26 +785,37 @@ int pbf_add(int a, int b) {
     int bn = (b < PBF_MID) ? 1 : 0;
     int am = (an == 1) ? (PBF_MID - 1 - a) : (a - PBF_MID);
     int bm = (bn == 1) ? (PBF_MID - 1 - b) : (b - PBF_MID);
-    int cm, cn;
+
+    // Coordinate (level for flat, position for tapered) and its Q13 step.
+    int ca = (u_format_kind == 1) ? pbft_mag_to_pos(am) : am;
+    int cb = (u_format_kind == 1) ? pbft_mag_to_pos(bm) : bm;
+    int step_q13 = u_base_step_log_q13;
+
+    int hi, lo, cn;
     if (an == bn) {
-        int hi = (am > bm) ? am : bm;
-        int lo = (am > bm) ? bm : am;
-        float d    = float(lo - hi) * u_ln_per_level;      // <= 0
-        float corr = log(1.0 + exp(d));                    // softplus
-        cm = hi + int(floor(corr / u_ln_per_level + 0.5));
+        if (ca >= cb) { hi = ca; lo = cb; }
+        else          { hi = cb; lo = ca; }
         cn = an;
     } else {
-        if (am == bm) return 0;
-        int hi, lo;
-        if (am > bm) { hi = am; lo = bm; cn = an; }
-        else         { hi = bm; lo = am; cn = bn; }
-        float d    = float(lo - hi) * u_ln_per_level;      // < 0
-        float corr = log(1.0 - exp(d));                    // softminus
-        if (corr != corr) corr = -30.0;                    // NaN guard
-        cm = hi + int(floor(corr / u_ln_per_level + 0.5));
+        if (ca == cb) return 0;
+        if (ca >  cb) { hi = ca; lo = cb; cn = an; }
+        else          { hi = cb; lo = ca; cn = bn; }
     }
-    if (cm < 0)           cm = 0;
-    if (cm >= PBF_LEVELS) cm = PBF_LEVELS - 1;
+
+    int d_q13   = (lo - hi) * step_q13;          // <= 0
+    int corr_q13 = (an == bn) ? pbf_softplus_cf(d_q13)
+                              : pbf_softminus_cf(d_q13);
+    int corr    = pbf_kdiv(corr_q13, step_q13);
+    int cc      = hi + corr;
+
+    int cm;
+    if (u_format_kind == 1) {
+        cm = pbft_pos_to_mag(cc);
+    } else {
+        cm = cc;
+        if (cm < 0)           cm = 0;
+        if (cm >= PBF_LEVELS) cm = PBF_LEVELS - 1;
+    }
     return (cn == 1) ? (PBF_MID - 1 - cm) : (PBF_MID + cm);
 }
 
@@ -920,7 +1220,7 @@ class FractalGL {
     }
     const vs = this._shader(gl.VERTEX_SHADER, VS);
     const fs = this._shader(gl.FRAGMENT_SHADER,
-      `precision highp float;\n` + fragSrc);
+      `precision highp float;\nprecision highp int;\n` + fragSrc);
     if (!vs || !fs) return false;
     const prog = gl.createProgram();
     gl.attachShader(prog, vs); gl.attachShader(prog, fs);
@@ -939,7 +1239,15 @@ class FractalGL {
     gl.shaderSource(s, src);
     gl.compileShader(s);
     if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-      console.error(gl.getShaderInfoLog(s));
+      const log = gl.getShaderInfoLog(s) || '(empty info log)';
+      const kind = (type === gl.VERTEX_SHADER) ? 'VERTEX' : 'FRAGMENT';
+      const numbered = src.split('\n').map((l, i) => String(i+1).padStart(4, ' ') + ': ' + l).join('\n');
+      // Dump full source into a <pre> on the page so it's not truncated.
+      const pre = document.createElement('pre');
+      pre.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:#000;color:#0f0;font:11px monospace;padding:10px;overflow:auto;z-index:9999;white-space:pre;';
+      pre.textContent = `${kind} SHADER COMPILE FAILED\n--- log ---\n${log}\n--- source ---\n${numbered}`;
+      document.body.appendChild(pre);
+      console.error(`${kind} shader failed (see overlay)`);
       return null;
     }
     return s;
@@ -967,20 +1275,43 @@ class FractalGL {
       if (l) gl.uniform1i(l, v);
     };
 
+    const setIv = (n, arr) => {
+      const l = gl.getUniformLocation(prog, n);
+      if (l) gl.uniform1iv(l, arr);
+    };
+
     set('u_center', cx, cy);
     set('u_scale', scale);
     set('u_res', this.canvas.width, this.canvas.height);
     setI('u_iter', iter);
     if (julia) set('u_julia', julia[0], julia[1]);
+
+    // Flat-format uniforms (ignored when tapered, but cheap to push).
     set('u_ln_per_level', currentFormat.ln_per_level);
     set('u_vmin', currentFormat.v_min);
     setI('u_offset', currentFormat.offset);
+
+    // Encoded constants (each format encodes them differently).
     setI('u_pbf_one',   currentFormat.pbf_one);
     setI('u_pbf_two',   currentFormat.pbf_two);
     setI('u_pbf_three', currentFormat.pbf_three);
-    setI('PBF_MID', currentFormat.mid);
-    setI('PBF_MAX', currentFormat.max_code);
+
+    // Format dispatch + Q13 step (used by the int CF for sb/db).
+    setI('u_format_kind',       currentFormat.is_taper ? 1 : 0);
+    setI('u_base_step_log_q13', currentFormat.base_step_log_q13);
+
+    setI('PBF_MID',    currentFormat.mid);
+    setI('PBF_MAX',    currentFormat.max_code);
     setI('PBF_LEVELS', currentFormat.n_levels);
+
+    if (currentFormat.is_taper) {
+      setIv('u_taper_mag_end',   currentFormat.taper_mag_end);
+      setIv('u_taper_pos_end',   currentFormat.taper_pos_end);
+      setIv('u_taper_pos_start', currentFormat.taper_pos_start);
+      setIv('u_taper_step',      currentFormat.taper_step);
+      setI('u_unity_pos',        currentFormat.unity_pos);
+      setI('u_max_pos',          currentFormat.max_pos);
+    }
 
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -1197,14 +1528,21 @@ function setupControls() {
     scheduleRender();
   };
 
+  const FORMATS = { pbf8: PBF8, pbf16: PBF16, tap8: TAP8, tap16: TAP16 };
+  const FORMAT_LABELS = {
+    pbf8:  'PBF8 — int mul/div, int Q13 CF for sb/db',
+    pbf16: 'PBF16 — int mul/div, int Q13 CF for sb/db',
+    tap8:  'Tapered PBF8 — int position mul/div, int CF for sb/db',
+    tap16: 'Tapered PBF16 — int position mul/div, int CF for sb/db',
+  };
   document.querySelectorAll('.format-btn').forEach(b => {
     b.onclick = () => {
-      const bits = parseInt(b.dataset.bits);
-      currentFormat = (bits === 16) ? PBF16 : PBF8;
+      const fmt = b.dataset.fmt;
+      currentFormat = FORMATS[fmt];
       document.querySelectorAll('.format-btn').forEach(x =>
         x.classList.toggle('active', x === b));
       document.getElementById('formatBadge').innerHTML =
-        `arithmetic: <strong>PBF${bits}</strong> (int mul/div, softplus add)`;
+        `arithmetic: <strong>${FORMAT_LABELS[fmt]}</strong>`;
       scheduleRender();
     };
   });

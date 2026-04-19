@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PBF Fractal — WASM (real Q32 CF)</title>
+<style>
+  :root { --bg:#0a0a0a; --panel:#141414; --text:#e8e8e8; --dim:#888; --accent:#e8ff3c; --border:#2a2a2a; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 12px ui-monospace, monospace; }
+  header { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; gap: 24px; align-items: baseline; }
+  header h1 { font-size: 14px; letter-spacing: 2px; color: var(--accent); }
+  header .badge { color: var(--dim); }
+  header .badge strong { color: var(--text); }
+  main { display: grid; grid-template-columns: 1fr 260px; gap: 12px; padding: 12px; }
+  canvas { background: #000; image-rendering: pixelated; width: 100%; height: auto; aspect-ratio: 1 / 1; }
+  .panel { background: var(--panel); border: 1px solid var(--border); padding: 12px; }
+  .panel h2 { font-size: 10px; letter-spacing: 2px; color: var(--dim); margin-bottom: 8px; text-transform: uppercase; }
+  .row { display: flex; gap: 6px; margin-bottom: 8px; }
+  .btn { flex: 1; padding: 6px; background: transparent; border: 1px solid var(--border); color: var(--dim); font: inherit; cursor: pointer; }
+  .btn:hover { color: var(--accent); border-color: var(--accent); }
+  .btn.active { color: var(--accent); border-color: var(--accent); background: rgba(232,255,60,0.08); }
+  label { display: block; color: var(--dim); margin: 8px 0 4px; }
+  input[type=range] { width: 100%; }
+  .stat { color: var(--dim); margin-top: 4px; }
+  .stat strong { color: var(--text); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>PBF FRACTAL · WASM</h1>
+  <div class="badge">running real <strong id="formatLabel">PBF16</strong> from <code>pbf.cpp</code> in WebAssembly — same Q32 CF as the C++ tests</div>
+</header>
+
+<main>
+  <canvas id="cv" width="384" height="384"></canvas>
+  <div>
+    <div class="panel">
+      <h2>Fractal</h2>
+      <div class="row" id="fractalBtns">
+        <button class="btn active" data-f="mandelbrot">Mandelbrot</button>
+        <button class="btn"        data-f="julia">Julia</button>
+        <button class="btn"        data-f="burning">Burning Ship</button>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <h2>Format</h2>
+      <div class="row">
+        <button class="btn"        data-fmt="pbf8">PBF8</button>
+        <button class="btn active" data-fmt="pbf16">PBF16</button>
+      </div>
+      <div class="row">
+        <button class="btn" data-fmt="tap8">TAP-PBF8</button>
+        <button class="btn" data-fmt="tap16">TAP-PBF16</button>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <h2>Iterations</h2>
+      <input type="range" id="iter" min="32" max="512" value="128" step="32">
+      <div class="stat">max iter: <strong id="iterVal">128</strong></div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <h2>Render</h2>
+      <div class="stat">last frame: <strong id="ms">—</strong></div>
+      <div class="stat">resolution: <strong id="res">384×384</strong></div>
+      <div class="stat" style="margin-top:8px;font-size:10px;line-height:1.5">drag to pan, wheel to zoom, double-click resets</div>
+    </div>
+  </div>
+</main>
+
+<script src="pbf_wasm.js"></script>
+<script>
+let mod = null, w = 384, h = 384;
+let cx = -0.5, cy = 0, scale = 2.5;
+let fractal = 'mandelbrot';
+let format = 'pbf16';
+let maxIter = 128;
+const juliaSeed = [-0.7269, 0.1889];
+
+const FORMAT_LABEL = {
+  pbf8:  'PBF8 (flat, 1e-4..1e4)',
+  pbf16: 'PBF16 (flat, 1e-8..1e8)',
+  tap8:  'Tapered PBF8 (1e-4..1e4, denser at unity)',
+  tap16: 'Tapered PBF16 (1e-8..1e8, denser at unity)',
+};
+
+function setupFormat() {
+  if (format === 'pbf8')       mod._pbf_init_w(8,  1e-4, 1e4);
+  else if (format === 'pbf16') mod._pbf_init_w(16, 1e-8, 1e8);
+  else if (format === 'tap8')  mod._pbf_taper_init_w(8,  1e4);
+  else if (format === 'tap16') mod._pbf_taper_init_w(16, 1e8);
+}
+
+let outPtr = 0, outLen = 0;
+function ensureBuf(n) {
+  if (n > outLen) {
+    if (outPtr) mod._free(outPtr);
+    outPtr = mod._malloc(n);
+    outLen = n;
+  }
+}
+
+const PALETTE = (() => {
+  // Cyclic, perceptually smooth-ish
+  const arr = new Uint8Array(256 * 4);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    arr[i*4 + 0] = Math.floor(255 * (0.5 + 0.5 * Math.cos(2*Math.PI * (t + 0.0))));
+    arr[i*4 + 1] = Math.floor(255 * (0.5 + 0.5 * Math.cos(2*Math.PI * (t + 0.33))));
+    arr[i*4 + 2] = Math.floor(255 * (0.5 + 0.5 * Math.cos(2*Math.PI * (t - 0.1))));
+    arr[i*4 + 3] = 255;
+  }
+  arr[3] = 255; arr[2] = 0; arr[1] = 0; arr[0] = 0;       // iter==max → black
+  return arr;
+})();
+
+function render() {
+  if (!mod) return;
+  const t0 = performance.now();
+  const n = w * h;
+  ensureBuf(n);
+  const isTaper = (format === 'tap8' || format === 'tap16') ? 1 : 0;
+
+  if      (fractal === 'mandelbrot')
+    mod._render_mandelbrot(outPtr, w, h, cx, cy, scale, maxIter, isTaper);
+  else if (fractal === 'julia')
+    mod._render_julia(outPtr, w, h, cx, cy, scale, juliaSeed[0], juliaSeed[1], maxIter, isTaper);
+  else if (fractal === 'burning')
+    mod._render_burning(outPtr, w, h, cx, cy, scale, maxIter, isTaper);
+
+  // Map iter bytes → RGBA via palette
+  const counts = mod.HEAPU8.subarray(outPtr, outPtr + n);
+  const img = new ImageData(w, h);
+  const out = img.data;
+  for (let i = 0; i < n; i++) {
+    const c = counts[i];
+    out[i*4 + 0] = PALETTE[c*4 + 0];
+    out[i*4 + 1] = PALETTE[c*4 + 1];
+    out[i*4 + 2] = PALETTE[c*4 + 2];
+    out[i*4 + 3] = 255;
+  }
+  const ctx = document.getElementById('cv').getContext('2d');
+  ctx.putImageData(img, 0, 0);
+
+  const ms = performance.now() - t0;
+  document.getElementById('ms').textContent = ms.toFixed(0) + ' ms';
+}
+
+const RESETS = {
+  mandelbrot: { cx: -0.5, cy: 0,    scale: 2.5 },
+  julia:      { cx: 0,    cy: 0,    scale: 2.5 },
+  burning:    { cx: -0.5, cy: -0.5, scale: 3.0 },
+};
+function resetView() {
+  const r = RESETS[fractal];
+  cx = r.cx; cy = r.cy; scale = r.scale;
+  render();
+}
+
+// ── UI ─────────────────────────────────────────────────────────────────────
+document.querySelectorAll('[data-f]').forEach(b => {
+  b.onclick = () => {
+    fractal = b.dataset.f;
+    document.querySelectorAll('[data-f]').forEach(x => x.classList.toggle('active', x === b));
+    resetView();
+  };
+});
+document.querySelectorAll('[data-fmt]').forEach(b => {
+  b.onclick = () => {
+    format = b.dataset.fmt;
+    document.querySelectorAll('[data-fmt]').forEach(x => x.classList.toggle('active', x === b));
+    document.getElementById('formatLabel').textContent = FORMAT_LABEL[format];
+    setupFormat();
+    render();
+  };
+});
+const iterEl = document.getElementById('iter');
+iterEl.oninput = () => {
+  maxIter = parseInt(iterEl.value);
+  document.getElementById('iterVal').textContent = maxIter;
+  render();
+};
+
+const cv = document.getElementById('cv');
+let dragging = false, drag0 = null, dragC = null;
+cv.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  dragging = true;
+  drag0 = { x: e.clientX, y: e.clientY };
+  dragC = { cx, cy };
+});
+window.addEventListener('mouseup', () => { dragging = false; });
+window.addEventListener('mousemove', e => {
+  if (!dragging) return;
+  const rect = cv.getBoundingClientRect();
+  const dx = (e.clientX - drag0.x) / rect.width;
+  const dy = (e.clientY - drag0.y) / rect.height;
+  cx = dragC.cx - dx * scale * (w / h);
+  cy = dragC.cy - dy * scale;
+  render();
+});
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  scale *= e.deltaY > 0 ? 1.2 : 1/1.2;
+  render();
+}, { passive: false });
+cv.addEventListener('dblclick', resetView);
+
+// ── boot ───────────────────────────────────────────────────────────────────
+createPbfModule().then(m => {
+  mod = m;
+  document.getElementById('formatLabel').textContent = FORMAT_LABEL[format];
+  setupFormat();
+  resetView();
+});
+</script>
+</body>
+</html>
