@@ -32,23 +32,24 @@
 
 <header>
   <h1>PBF FRACTAL RGB · WEBGL2</h1>
-  <div class="meta"><strong>7-layer LLM</strong> · 6 stages/layer · 42 <strong>PBF12</strong> fractal tiles · <span id="bagde">Embed · LNS · Linear · Polar · FFN · Residual</span> · <span id="msStat">— ms</span></div>
+  <div class="meta"><strong>7-layer LLM</strong> · 7 stages/layer · 49 <strong>PBF12</strong> fractal tiles · <span id="bagde">Embed · LNS · Linear · Polar · Tapered · FFN · Residual</span> · <span id="msStat">— ms</span></div>
 </header>
 
 <main>
   <canvas id="cv" width="1200" height="1200"></canvas>
   <div>
     <div class="panel">
-      <h2>7-Layer LLM · 6 stages/layer</h2>
+      <h2>7-Layer LLM · 7 stages/layer</h2>
       <div class="legend">
-        The canvas tiles into a <strong>7×6 grid</strong>: 7 transformer layers (rows, bottom→top) × 6 stage columns per layer. Each tile is a PBF12 fractal rendered in the arithmetic that implements that stage.<br><br>
+        The canvas tiles into a <strong>7×7 grid</strong>: 7 transformer layers (rows, bottom→top) × 7 stage columns per layer. Each tile is a PBF12 fractal rendered in the arithmetic that implements that stage.<br><br>
         <span style="color:#e8ff3c;">Col 0 — Embed</span>: Mandelbrot baseline; per-layer seed rotation mimics layer-specific feature mixing.<br>
-        <span style="color:#e8ff3c;">Col 1 — Attn (LNS)</span>: log-domain KQV·α attention. Q=Mandelbrot, K=Julia, V=Burning, α=σ(Q·K/N²−½). The current crate's default FPU path.<br>
-        <span style="color:#e8ff3c;">Col 2 — Attn (Linear)</span>: same KQV·α, but every mul/add in linear SBP<sub>12</sub> (Q<sub>8</sub>, saturating). Demonstrates the overflow-legal property mid-compute.<br>
-        <span style="color:#e8ff3c;">Col 3 — Attn (Polar)</span>: Mandelbrot orbit rendered in polar form — R = phase hue via SBP atan2, G = log|z|, B = smooth iter. Shows polar-overlay mul/div cost (position adds only).<br>
-        <span style="color:#e8ff3c;">Col 4 — FFN (Newton)</span>: z³−1 Newton iteration as the non-linear feed-forward. No black pockets at f'(z)=0 (P27/P28 via SBP div).<br>
-        <span style="color:#e8ff3c;">Col 5 — Residual</span>: heuristic blend of Col 0 ⊕ Col 1 ⊕ Col 4 as the layer's output, feeding the next row.<br><br>
-        Per-row Julia seed rotates by +0.5 rad/layer so each row visibly attends to a different feature direction. Zoom tightens 0.85× per layer to simulate deepening feature hierarchy.
+        <span style="color:#e8ff3c;">Col 1 — Attn (LNS)</span>: log-domain KQV·α attention. Q=Mandelbrot, K=Julia, V=Burning, α=σ(Q·K/N²−½). The crate's default FPU path.<br>
+        <span style="color:#e8ff3c;">Col 2 — Attn (Linear)</span>: same KQV·α but in linear SBP<sub>12</sub> (Q<sub>8</sub>, saturating). Overflow-legal mid-compute.<br>
+        <span style="color:#e8ff3c;">Col 3 — Attn (Polar)</span>: Mandelbrot orbit in polar form — R = phase hue via SBP atan2, G = log|z|, B = smooth iter.<br>
+        <span style="color:#e8ff3c;">Col 4 — Attn (Tapered)</span>: Mandelbrot magnitude read directly from the encoded PBF<sub>12</sub> geometric level — the denormal taper keeps very-small |z| distinguishable where IEEE subnormals would flush to zero (P32).<br>
+        <span style="color:#e8ff3c;">Col 5 — FFN (Newton)</span>: z³−1 Newton iteration as the non-linear feed-forward. No black pockets at f'(z)=0 (P27 / P28).<br>
+        <span style="color:#e8ff3c;">Col 6 — Residual</span>: heuristic blend of Col 0 ⊕ Col 1 ⊕ Col 5 as the layer's output, feeding the next row.<br><br>
+        Per-row Julia seed rotates +0.5 rad/layer so each row visibly attends to a different feature direction. Zoom tightens 0.85×/layer to simulate deepening feature hierarchy.
       </div>
     </div>
 
@@ -794,6 +795,24 @@ ivec4 llm_cell(vec2 local_uv, int layer, int stage) {
                      15);
     }
     if (stage == 4) {
+        // Attn (Tapered) — PBF12's denormal taper: very-small |z| stays
+        // distinguishable in geometric levels instead of flushing to zero
+        // as IEEE subnormals would. The low nibble of the encoded
+        // magnitude code is the finest-grade gradient.
+        ivec2 z = c;
+        int n;
+        for (n = 0; n < 256; n++) {
+            if (n >= u_max_iter) break;
+            if (pbfc_abs2(z) > u_pbf_four) break;
+            z = pbfc_sqr_add(z, c);
+        }
+        int mag_code = pbfc_abs2(z);
+        return ivec4((mag_code >> 0) & 0xF,    // finest grade
+                     (mag_code >> 4) & 0xF,    // coarse grade
+                     quantize4(smooth_iter(n, pbf_decode(mag_code), u_max_iter), u_max_iter),
+                     15);
+    }
+    if (stage == 5) {
         // FFN (Newton) — z³−1 iteration; P27 no-singularity.
         float packed = run_newton(c, u_max_iter);
         float iter_frac = floor(packed * 100.0) / 100.0;
@@ -804,7 +823,7 @@ ivec4 llm_cell(vec2 local_uv, int layer, int stage) {
                      (root == 1) ? 15 : 0,
                      (root == 2) ? 15 : 3);
     }
-    // stage == 5 — Residual: heuristic blend of embed ⊕ attn(LNS) ⊕ FFN.
+    // stage == 6 — Residual: heuristic blend of embed ⊕ attn(LNS) ⊕ FFN.
     float embed  = run_mandelbrot(c, u_max_iter);
     float kj     = run_julia(c, seed, u_max_iter);
     float burn   = run_burning(c, u_max_iter);
@@ -819,13 +838,13 @@ ivec4 llm_cell(vec2 local_uv, int layer, int stage) {
                  int(clamp(floor(a * 15.0 + 0.5), 0.0, 15.0)));
 }
 
-// 7-layer × 6-stage LLM grid. Canvas partitions into a 6×7 tile layout
-// (6 columns of stages, 7 rows of layers, bottom-up). Each tile is a
+// 7-layer × 7-stage LLM grid. Canvas partitions into a 7×7 tile layout
+// (7 columns of stages, 7 rows of layers, bottom-up). Each tile is a
 // self-contained fractal rendered in the arithmetic for that stage. A
-// 2-pixel white border separates tiles so the grid is legible.
+// 2-pixel grey border separates tiles so the grid is legible.
 ivec4 sample_px(vec2 pix) {
-    vec2 tile_sz = u_res / vec2(6.0, 7.0);
-    int stage = int(clamp(floor(pix.x / tile_sz.x), 0.0, 5.0));          // column
+    vec2 tile_sz = u_res / vec2(7.0, 7.0);
+    int stage = int(clamp(floor(pix.x / tile_sz.x), 0.0, 6.0));          // column
     int layer = int(clamp(floor((u_res.y - pix.y) / tile_sz.y), 0.0, 6.0)); // row, 0 = top
     layer = 6 - layer;                                                    // flip so layer 0 at bottom
 
