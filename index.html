@@ -32,33 +32,23 @@
 
 <header>
   <h1>PBF FRACTAL RGB · WEBGL2</h1>
-  <div class="meta">3 × <strong>PBF12</strong> compute lanes per pixel · <span id="bagde">SBP + CF (int Q13)</span> · CF is the AA · <span id="msStat">— ms</span></div>
+  <div class="meta"><strong>7-layer LLM</strong> · 6 stages/layer · 42 <strong>PBF12</strong> fractal tiles · <span id="bagde">Embed · LNS · Linear · Polar · FFN · Residual</span> · <span id="msStat">— ms</span></div>
 </header>
 
 <main>
   <canvas id="cv" width="1200" height="1200"></canvas>
   <div>
     <div class="panel">
-      <h2>Demo</h2>
-      <div class="row">
-        <button class="btn"        data-demo="quant">Quant · 3×RGB</button>
-        <button class="btn active" data-demo="infer">Infer · 4×RGBA</button>
-      </div>
-      <div class="row">
-        <button class="btn" data-demo="p27">P27 · Newton</button>
-        <button class="btn" data-demo="p35">P35 · Overflow</button>
-      </div>
-      <div class="row">
-        <button class="btn" data-demo="p31">P31 · Polar</button>
-        <button class="btn" data-demo="p32">P32 · Taper</button>
-      </div>
+      <h2>7-Layer LLM · 6 stages/layer</h2>
       <div class="legend">
-        <strong>Quant</strong> (3×RGB): three PBF12 fractals — Mandelbrot/Julia/Burning — quantised to 4 bits per channel, no attention layer.<br>
-        <strong>Infer</strong> (4×RGBA): KQV·A attention — Q=Mandelbrot, K=Julia, V=Burning, α=σ(Q·K)·V. One-token one-head inference.<br>
-        <strong>P27 Newton</strong>: z³−1 Newton iteration. IEEE rendering shows black NaN pockets at critical points; SBP log-domain division saturates gracefully — no black holes (P27 + P28).<br>
-        <strong>P35 Overflow</strong>: linear SBP<sub>12</sub> (signed Q<sub>8</sub>, ±8 range). Saturated 12-bit bits, sign-extended, are already a valid SBP<sub>24</sub> — width promotion is free.<br>
-        <strong>P31 Polar</strong>: Mandelbrot orbit rendered in polar form — R = phase hue (atan2 over SBP), G = log|z|, B = iter. Polar mul/div are position adds; only the `+c` step leaves polar. Shows phase-precision retention at deep zoom.<br>
-        <strong>P32 Taper</strong>: Mandelbrot shaded by |z_final| under SBP's denormal taper. Values below the normal range stay distinct (geometric spacing) instead of flushing to zero as in IEEE subnormals — R = low bits, G = high bits of the tapered magnitude.
+        The canvas tiles into a <strong>7×6 grid</strong>: 7 transformer layers (rows, bottom→top) × 6 stage columns per layer. Each tile is a PBF12 fractal rendered in the arithmetic that implements that stage.<br><br>
+        <span style="color:#e8ff3c;">Col 0 — Embed</span>: Mandelbrot baseline; per-layer seed rotation mimics layer-specific feature mixing.<br>
+        <span style="color:#e8ff3c;">Col 1 — Attn (LNS)</span>: log-domain KQV·α attention. Q=Mandelbrot, K=Julia, V=Burning, α=σ(Q·K/N²−½). The current crate's default FPU path.<br>
+        <span style="color:#e8ff3c;">Col 2 — Attn (Linear)</span>: same KQV·α, but every mul/add in linear SBP<sub>12</sub> (Q<sub>8</sub>, saturating). Demonstrates the overflow-legal property mid-compute.<br>
+        <span style="color:#e8ff3c;">Col 3 — Attn (Polar)</span>: Mandelbrot orbit rendered in polar form — R = phase hue via SBP atan2, G = log|z|, B = smooth iter. Shows polar-overlay mul/div cost (position adds only).<br>
+        <span style="color:#e8ff3c;">Col 4 — FFN (Newton)</span>: z³−1 Newton iteration as the non-linear feed-forward. No black pockets at f'(z)=0 (P27/P28 via SBP div).<br>
+        <span style="color:#e8ff3c;">Col 5 — Residual</span>: heuristic blend of Col 0 ⊕ Col 1 ⊕ Col 4 as the layer's output, feeding the next row.<br><br>
+        Per-row Julia seed rotates by +0.5 rad/layer so each row visibly attends to a different feature direction. Zoom tightens 0.85× per layer to simulate deepening feature hierarchy.
       </div>
     </div>
 
@@ -727,171 +717,128 @@ float e2m2_decode(int code) {
 // independent CF fractals Mandelbrot / Julia / Burning Ship / Tricorn —
 // structurally analogous to the Q / K / V / O projections of one attention
 // head running on the same input coordinate.
-ivec4 sample_px(vec2 pix) {
-    vec2 uv = (pix / u_res - 0.5) * vec2(u_res.x / u_res.y, 1.0);
-    float re = u_center.x + uv.x * u_scale;
-    float im = u_center.y + uv.y * u_scale;
-    ivec2 c  = ivec2(pbf_encode(re), pbf_encode(im));
+// Per-layer Julia seed rotation — each of the 7 layers attends to a different
+// feature direction. Rotation angle +0.5 rad/layer.
+ivec2 layer_seed(int layer) {
+    float re_in = pbf_decode(u_julia_seed.x);
+    float im_in = pbf_decode(u_julia_seed.y);
+    float phi = float(layer) * 0.5;
+    float c = cos(phi), s = sin(phi);
+    return ivec2(pbf_encode(re_in * c - im_in * s),
+                 pbf_encode(re_in * s + im_in * c));
+}
 
-    int r4, g4, b4, a4;
+// Render one stage of one layer, given the local UV within that tile and
+// the layer's own zoom + seed. Returns an RGBA quantised to 4 bits.
+ivec4 llm_cell(vec2 local_uv, int layer, int stage) {
+    // Per-layer zoom: deepening feature hierarchy.
+    float scale = u_scale * pow(0.85, float(layer));
+    float re = u_center.x + local_uv.x * scale;
+    float im = u_center.y + local_uv.y * scale;
+    ivec2 c = ivec2(pbf_encode(re), pbf_encode(im));
+    ivec2 seed = layer_seed(layer);
 
-    // ── Demo dispatch ─────────────────────────────────────────────────────
-    // u_demo: 0 Quant3 · 1 Infer4 · 2 P27 Newton · 3 P35 Linear
-    if (u_demo == 0) {
-        // Quant 4-bit RGB, 3 fractals, no attention layer.
+    if (stage == 0) {
+        // Embed — Mandelbrot baseline, per-layer zoom.
+        float s = run_mandelbrot(c, u_max_iter);
+        int q = quantize4(s, u_max_iter);
+        return ivec4(q, q, q, 15);
+    }
+    if (stage == 1) {
+        // Attn (LNS) — log-domain KQV·α.
         float q = run_mandelbrot(c, u_max_iter);
-        float k = run_julia(c, u_julia_seed, u_max_iter);
+        float k = run_julia(c, seed, u_max_iter);
         float v = run_burning(c, u_max_iter);
-        r4 = quantize4(q, u_max_iter);
-        g4 = quantize4(k, u_max_iter);
-        b4 = quantize4(v, u_max_iter);
-        a4 = 15;
-        return ivec4(r4, g4, b4, a4);
-    }
-    if (u_demo == 2) {
-        // P27 Newton — z³ − 1 iteration via SBP log-domain complex div.
-        // Pack: R = iter count, G = root-0 proximity, B = root-1 proximity,
-        // A = root-2 proximity (all quantise4-coded).
-        float packed = run_newton(c, u_max_iter);
-        float iter_frac = floor(packed * 100.0) / 100.0;
-        float root_tag  = (packed - iter_frac) * 100.0 * 3.0;  // 0,1,2
-        int root = int(round(root_tag));
-        r4 = quantize4(iter_frac * float(u_max_iter), u_max_iter);
-        g4 = (root == 0) ? 15 : 0;
-        b4 = (root == 1) ? 15 : 0;
-        a4 = (root == 2) ? 15 : 3;  // alpha tags root-2, always ≥ 3 so never fully transparent
-        return ivec4(r4, g4, b4, a4);
-    }
-    if (u_demo == 3 || u_compute_mode == 2) {
-        // P35 Linear SBP path — saturating Q8 integer ops. The four lanes
-        // project Q / K / V / Tricorn in linear SBP₁₂. Saturation regions
-        // visualise where the 12-bit magnitude is actually a legal SBP₂₄.
-        ivec2 c_lin    = ivec2(lin_encode(re), lin_encode(im));
-        ivec2 seed_lin = ivec2(lin_encode(pbf_decode(u_julia_seed.x)),
-                               lin_encode(pbf_decode(u_julia_seed.y)));
-        float q = run_mandelbrot_lin(c_lin, u_max_iter);
-        float k = run_julia_lin(c_lin, seed_lin, u_max_iter);
-        float v = run_burning_lin(c_lin, u_max_iter);
-        float tc = run_tricorn_lin(c_lin, u_max_iter);
         float N = float(u_max_iter);
         float qk = (q * k) / (N * N);
         float a = 1.0 / (1.0 + exp(-8.0 * (qk - 0.5)));
-        float av = a * v;
-        r4 = quantize4(av, u_max_iter);
-        g4 = quantize4(q,  u_max_iter);
-        b4 = quantize4(k,  u_max_iter);
-        a4 = quantize4(tc, u_max_iter);
-        return ivec4(r4, g4, b4, a4);
+        return ivec4(quantize4(a * v, u_max_iter),
+                     quantize4(q, u_max_iter),
+                     quantize4(k, u_max_iter),
+                     int(clamp(floor(a * 15.0 + 0.5), 0.0, 15.0)));
     }
-    if (u_demo == 4) {
-        // P31 Polar — run Mandelbrot, render final z in polar coords.
-        // R = phase hue (atan2 over SBP-decoded reals; phase ∈ [-π, π] maps
-        //     to 4-bit bucket via mod-1 wrap),
-        // G = log|z| magnitude (polar's native coordinate — position add
-        //     under polar overlay),
-        // B = iter-to-escape (smooth),
-        // A = fully opaque.
-        ivec2 z = c;
-        int n;
-        for (n = 0; n < 256; n++) {
-            if (n >= u_max_iter) break;
-            if (pbfc_abs2(z) > u_pbf_four) break;
-            z = pbfc_sqr_add(z, c);
-        }
-        float re_f = pbf_decode(z.x);
-        float im_f = pbf_decode(z.y);
-        float phase = atan(im_f, re_f);                    // [-π, π]
-        float hue_u = (phase / 6.2831853) + 0.5;           // [0, 1)
-        float mag2_f = pbf_decode(pbfc_abs2(z));
-        float log_r  = clamp(0.5 + 0.25 * log(max(mag2_f, 1e-30)), 0.0, 1.0);
-        float iter_s = smooth_iter(n, mag2_f, u_max_iter);
-        r4 = int(clamp(floor(hue_u  * 15.0 + 0.5), 0.0, 15.0));
-        g4 = int(clamp(floor(log_r  * 15.0 + 0.5), 0.0, 15.0));
-        b4 = quantize4(iter_s, u_max_iter);
-        a4 = 15;
-        return ivec4(r4, g4, b4, a4);
-    }
-    if (u_demo == 5) {
-        // P32 Taper — run Mandelbrot, render with fine-grained magnitude
-        // shading that keeps subnormal-range values distinct. The PBF12
-        // format's denormal taper means small |z| still encodes into
-        // separable levels (geometric spacing toward zero) rather than
-        // flushing to a single "zero" bucket as IEEE subnormals would.
-        ivec2 z = c;
-        int n;
-        for (n = 0; n < 256; n++) {
-            if (n >= u_max_iter) break;
-            if (pbfc_abs2(z) > u_pbf_four) break;
-            z = pbfc_sqr_add(z, c);
-        }
-        // Read the encoded magnitude directly — bypasses pbf_decode so the
-        // 11-bit geometric level (including denormals at the low end) is
-        // what drives the shading.
-        int mag_code = pbfc_abs2(z);
-        // Split into low-bits / high-bits for R/G so fine denormal
-        // gradations stay visible; B carries the escape iter.
-        r4 = (mag_code >> 0) & 0xF;     // bottom nibble = finest grade
-        g4 = (mag_code >> 4) & 0xF;     // next nibble  = coarse grade
-        b4 = quantize4(smooth_iter(n, pbf_decode(mag_code), u_max_iter), u_max_iter);
-        a4 = 15;
-        return ivec4(r4, g4, b4, a4);
-    }
-    // u_demo == 1 (Infer 4×RGBA attention) — falls through to the legacy
-    // KQV·A path gated on u_display for trio/ceiling/phase/cmp sub-modes.
-
-    if (u_display == 0) {
-        // KQV·A: each pixel simulates one-token / one-head attention where
-        //   Q = Mandelbrot escape time (query score)
-        //   K = Julia escape time     (key score)
-        //   V = Burning-Ship escape   (value)
-        //   A = σ(8 · (Q·K / N² − 0.5))  — attention weight in [0, 1]
-        //   out = A · V
-        // R shows A·V (attention-weighted output), G shows Q, B shows K,
-        // alpha shows A. Zooming reveals where attention concentrates —
-        // the "active" regions of the KQ agreement landscape.
-        float q = run_mandelbrot(c, u_max_iter);
-        float k = run_julia(c, u_julia_seed, u_max_iter);
-        float v = run_burning(c, u_max_iter);
-        float N  = float(u_max_iter);
+    if (stage == 2) {
+        // Attn (Linear) — saturating Q8 linear SBP₁₂.
+        ivec2 c_lin = ivec2(lin_encode(re), lin_encode(im));
+        ivec2 seed_lin = ivec2(lin_encode(pbf_decode(seed.x)),
+                               lin_encode(pbf_decode(seed.y)));
+        float q = run_mandelbrot_lin(c_lin, u_max_iter);
+        float k = run_julia_lin(c_lin, seed_lin, u_max_iter);
+        float v = run_burning_lin(c_lin, u_max_iter);
+        float N = float(u_max_iter);
         float qk = (q * k) / (N * N);
-        float a  = 1.0 / (1.0 + exp(-8.0 * (qk - 0.5)));
-        float av = a * v;
-        r4 = quantize4(av, u_max_iter);
-        g4 = quantize4(q,  u_max_iter);
-        b4 = quantize4(k,  u_max_iter);
-        a4 = int(clamp(floor(a * 15.0 + 0.5), 0.0, 15.0));
-    } else if (u_display == 1) {
-        r4 = quantize4(run_mandelbrot(c, u_max_iter / 4), u_max_iter / 4);
-        g4 = quantize4(run_mandelbrot(c, u_max_iter / 2), u_max_iter / 2);
-        b4 = quantize4(run_mandelbrot(c, u_max_iter),     u_max_iter);
-        a4 = 15; // opaque in ceiling mode
-    } else if (u_display == 2) {
+        float a = 1.0 / (1.0 + exp(-8.0 * (qk - 0.5)));
+        return ivec4(quantize4(a * v, u_max_iter),
+                     quantize4(q, u_max_iter),
+                     quantize4(k, u_max_iter),
+                     int(clamp(floor(a * 15.0 + 0.5), 0.0, 15.0)));
+    }
+    if (stage == 3) {
+        // Attn (Polar) — phase hue + log magnitude.
         ivec2 z = c;
-        int n = u_max_iter;
-        for (int i = 0; i < 256; i++) {
-            if (i >= u_max_iter) break;
-            if (pbfc_abs2(z) > u_pbf_four) { n = i; break; }
+        int n;
+        for (n = 0; n < 256; n++) {
+            if (n >= u_max_iter) break;
+            if (pbfc_abs2(z) > u_pbf_four) break;
             z = pbfc_sqr_add(z, c);
         }
         float re_f = pbf_decode(z.x);
         float im_f = pbf_decode(z.y);
-        float re_n = clamp(0.5 + 0.25 * re_f, 0.0, 1.0);
-        float im_n = clamp(0.5 + 0.25 * im_f, 0.0, 1.0);
-        r4 = int(floor(re_n * 15.0 + 0.5));
-        g4 = int(floor(im_n * 15.0 + 0.5));
+        float phase = atan(im_f, re_f);
+        float hue = (phase / 6.2831853) + 0.5;
         float mag2 = pbf_decode(pbfc_abs2(z));
-        b4 = quantize4(smooth_iter(n, mag2, u_max_iter), u_max_iter);
-        a4 = 15;
-    } else {
-        float s = run_mandelbrot(c, u_max_iter);
-        int q = quantize4(s, u_max_iter);
-        r4 = q;
-        g4 = (q * 13) / 15;
-        b4 = (q * q) / 15;
-        a4 = 15;
+        float log_r = clamp(0.5 + 0.25 * log(max(mag2, 1e-30)), 0.0, 1.0);
+        return ivec4(int(clamp(floor(hue * 15.0 + 0.5), 0.0, 15.0)),
+                     int(clamp(floor(log_r * 15.0 + 0.5), 0.0, 15.0)),
+                     quantize4(smooth_iter(n, mag2, u_max_iter), u_max_iter),
+                     15);
     }
+    if (stage == 4) {
+        // FFN (Newton) — z³−1 iteration; P27 no-singularity.
+        float packed = run_newton(c, u_max_iter);
+        float iter_frac = floor(packed * 100.0) / 100.0;
+        float root_tag = (packed - iter_frac) * 100.0 * 3.0;
+        int root = int(round(root_tag));
+        return ivec4(quantize4(iter_frac * float(u_max_iter), u_max_iter),
+                     (root == 0) ? 15 : 0,
+                     (root == 1) ? 15 : 0,
+                     (root == 2) ? 15 : 3);
+    }
+    // stage == 5 — Residual: heuristic blend of embed ⊕ attn(LNS) ⊕ FFN.
+    float embed  = run_mandelbrot(c, u_max_iter);
+    float kj     = run_julia(c, seed, u_max_iter);
+    float burn   = run_burning(c, u_max_iter);
+    float N      = float(u_max_iter);
+    float attn   = (kj * embed) / (N * N);
+    float a      = 1.0 / (1.0 + exp(-8.0 * (attn - 0.5)));
+    float ffn    = floor(run_newton(c, u_max_iter) * 100.0) / 100.0 * N;
+    float out_r  = a * burn + embed * 0.3 + ffn * 0.2;
+    return ivec4(quantize4(out_r,   u_max_iter),
+                 quantize4(embed,   u_max_iter),
+                 quantize4(ffn,     u_max_iter),
+                 int(clamp(floor(a * 15.0 + 0.5), 0.0, 15.0)));
+}
 
-    return ivec4(r4, g4, b4, a4);
+// 7-layer × 6-stage LLM grid. Canvas partitions into a 6×7 tile layout
+// (6 columns of stages, 7 rows of layers, bottom-up). Each tile is a
+// self-contained fractal rendered in the arithmetic for that stage. A
+// 2-pixel white border separates tiles so the grid is legible.
+ivec4 sample_px(vec2 pix) {
+    vec2 tile_sz = u_res / vec2(6.0, 7.0);
+    int stage = int(clamp(floor(pix.x / tile_sz.x), 0.0, 5.0));          // column
+    int layer = int(clamp(floor((u_res.y - pix.y) / tile_sz.y), 0.0, 6.0)); // row, 0 = top
+    layer = 6 - layer;                                                    // flip so layer 0 at bottom
+
+    // Tile-local pixel + 2-pixel separator.
+    vec2 local = vec2(mod(pix.x, tile_sz.x), mod(u_res.y - pix.y, tile_sz.y));
+    if (local.x < 2.0 || local.y < 2.0
+        || local.x > tile_sz.x - 2.0
+        || local.y > tile_sz.y - 2.0) {
+        return ivec4(4, 4, 4, 15);  // dim grey grid line
+    }
+    vec2 local_uv = (local / tile_sz - 0.5) * 2.0;
+    local_uv.x *= tile_sz.x / tile_sz.y;  // preserve tile aspect
+    return llm_cell(local_uv, layer, stage);
 }
 
 uniform vec2 u_jitter;     // subpixel offset for this pass (fraction of a pixel)
