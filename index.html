@@ -11,9 +11,17 @@
   header h1 { font-size:14px; letter-spacing:2px; color:var(--accent); }
   header .meta { color:var(--dim); }
   header .meta strong { color:var(--text); }
+  .topbar { display:flex; gap:24px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--border); background:var(--panel); }
+  .topbar .ctl { display:flex; gap:10px; align-items:center; flex:1; }
+  .topbar .ctl label { color:var(--accent); font-size:10px; letter-spacing:2px; text-transform:uppercase; margin:0; white-space:nowrap; }
+  .topbar .ctl input[type=range] { flex:1; min-width:200px; accent-color:var(--accent); }
+  .topbar .ctl span { color:var(--text); font-weight:bold; min-width:56px; text-align:right; font-variant-numeric:tabular-nums; }
   main { display:grid; grid-template-columns:1fr 280px; gap:12px; padding:12px; }
-  canvas { background:#000; image-rendering:auto; width:100%; height:auto; aspect-ratio:1/1; cursor:grab; }
+  canvas { background:#000; image-rendering:auto; width:100%; height:auto; aspect-ratio:7/1; cursor:grab; display:block; }
   canvas:active { cursor:grabbing; }
+  .layer-stack { display:flex; flex-direction:column; gap:4px; }
+  .layer-row { display:flex; align-items:stretch; gap:8px; }
+  .layer-label { width:44px; color:var(--accent); font-size:10px; font-weight:bold; letter-spacing:2px; text-align:center; display:flex; align-items:center; justify-content:center; border:1px solid var(--border); background:var(--panel); }
   .panel { background:var(--panel); border:1px solid var(--border); padding:12px; margin-bottom:12px; }
   .panel h2 { font-size:10px; letter-spacing:2px; color:var(--dim); margin-bottom:8px; text-transform:uppercase; }
   .row { display:flex; gap:6px; margin-bottom:6px; }
@@ -32,16 +40,33 @@
 
 <header>
   <h1>PBF FRACTAL RGB · WEBGL2</h1>
-  <div class="meta"><strong>7-layer LLM</strong> · 7 stages/layer · 49 <strong>PBF12</strong> fractal tiles · <span id="bagde">Embed · LNS · Linear · Polar · Tapered · FFN · Residual</span> · <span id="msStat">— ms</span></div>
+  <div class="meta"><strong>3-layer LLM</strong> · 7 stages/layer · 21 <strong>PBF12</strong> fractal tiles · <span id="bagde">Embed · LNS · Linear · Polar · Tapered · FFN · Residual</span> · <span id="msStat">— ms</span></div>
 </header>
 
+<div class="topbar">
+  <div class="ctl">
+    <label for="bright">Brightness</label>
+    <input type="range" id="bright" min="0.3" max="5.0" value="1.0" step="0.05">
+    <span>× <strong id="brightVal">1.00</strong></span>
+  </div>
+  <div class="ctl">
+    <label for="speed">Speed</label>
+    <input type="range" id="speed" min="0.05" max="2.0" value="1.0" step="0.05">
+    <span>× <strong id="speedVal">1.00</strong></span>
+  </div>
+</div>
+
 <main>
-  <canvas id="cv" width="1200" height="1200"></canvas>
+  <div class="layer-stack">
+    <div class="layer-row"><div class="layer-label">L2</div><canvas id="cv2" width="1400" height="200"></canvas></div>
+    <div class="layer-row"><div class="layer-label">L1</div><canvas id="cv1" width="1400" height="200"></canvas></div>
+    <div class="layer-row"><div class="layer-label">L0</div><canvas id="cv0" width="1400" height="200"></canvas></div>
+  </div>
   <div>
     <div class="panel">
-      <h2>7-Layer LLM · 7 stages/layer</h2>
+      <h2>3-Layer LLM · 7 stages/layer</h2>
       <div class="legend">
-        The canvas tiles into a <strong>7×7 grid</strong>: 7 transformer layers (rows, bottom→top) × 7 stage columns per layer. Each tile is a PBF12 fractal rendered in the arithmetic that implements that stage.<br><br>
+        The stack is <strong>3 separate canvases</strong>, one per transformer layer (L0 bottom → L2 top), each split into 7 stage columns. Each tile is a PBF12 fractal rendered in the arithmetic that implements that stage.<br><br>
         <span style="color:#e8ff3c;">Col 0 — Embed</span>: Mandelbrot baseline; per-layer seed rotation mimics layer-specific feature mixing.<br>
         <span style="color:#e8ff3c;">Col 1 — Attn (LNS)</span>: log-domain KQV·α attention. Q=Mandelbrot, K=Julia, V=Burning, α=σ(Q·K/N²−½). The crate's default FPU path.<br>
         <span style="color:#e8ff3c;">Col 2 — Attn (Linear)</span>: same KQV·α but in linear SBP<sub>12</sub> (Q<sub>8</sub>, saturating). Overflow-legal mid-compute.<br>
@@ -181,6 +206,9 @@ uniform float u_scale;
 uniform int  u_max_iter;
 uniform int  u_compute_mode;   // 0 = SBP only, 1 = SBP + CF, 2 = Linear SBP
 uniform int  u_demo;           // 0 Quant3 · 1 Infer4 · 2 P27 Newton · 3 P35 Linear
+uniform float u_time;          // seconds since page load — drives merge animation
+uniform int  u_layer;          // 0..2 — which of the 3 LLM layers this canvas renders
+uniform float u_brightness;    // output gain applied to final RGBA (1.0 = neutral)
 uniform int  u_display;        // 0 trio, 1 ceilings, 2 phase, 3 sbp-vs-cf
 uniform ivec2 u_julia_seed;    // pre-encoded seed
 uniform int  u_pbf_four;       // pre-encoded 4.0
@@ -701,6 +729,21 @@ int quantize4(float s, int max_iter) {
     return int(clamp(code, 0.0, 15.0));
 }
 
+// Brighter 4-bit quantisation for attention stages — linear map with a γ=0.4
+// curve so low-intensity lanes lift away from black and remain visibly coloured.
+// Used for LNS / Linear columns where the "attention weight" should read as
+// a hot/cold intensity, not the periodic log banding that `quantize4` produces.
+int bright4(float s, int max_iter) {
+    float n = clamp(s / float(max_iter), 0.0, 1.0);
+    float b = pow(n, 0.40);
+    return int(clamp(floor(b * 15.0 + 0.5), 0.0, 15.0));
+}
+
+// Integer mix — blends two 4-bit codes by `t ∈ [0, 1]`.
+int mix4(int a, int b, float t) {
+    return int(clamp(floor(mix(float(a), float(b), t) + 0.5), 0.0, 15.0));
+}
+
 // e2m2 decode: 4-bit code → [0, 1] with 2-exp, 2-mant geometric spacing.
 // bias=1: subnormals {0, .25, .5, .75}, normals up to (1+3/4)*2^2 = 7.0,
 // then divide by 7.0 for [0,1].
@@ -739,27 +782,60 @@ ivec4 llm_cell(vec2 local_uv, int layer, int stage) {
     ivec2 c = ivec2(pbf_encode(re), pbf_encode(im));
     ivec2 seed = layer_seed(layer);
 
+    // Animation merge factor — oscillates 0→1→0 every ~5 s, with a small
+    // per-layer phase offset so the merge "wave" travels through the stack
+    // rather than pulsing everywhere simultaneously.
+    float phase_layer = float(layer) * 0.35;
+    float t_merge = 0.5 - 0.5 * cos(u_time * 1.2 + phase_layer);
+
+    // Embed baseline used by every attention-stage merge.
+    float embed_iter = run_mandelbrot(c, u_max_iter);
+    int embed_q = quantize4(embed_iter, u_max_iter);
+
     if (stage == 0) {
-        // Embed — Mandelbrot baseline, per-layer zoom.
-        float s = run_mandelbrot(c, u_max_iter);
-        int q = quantize4(s, u_max_iter);
-        return ivec4(q, q, q, 15);
+        // Embed — for the bottom row (layer 0), pure Mandelbrot input.
+        // For upper rows, animate the PREVIOUS row's residual flowing in so
+        // the grid reads bottom-up as a real transformer stack: row 1's
+        // merge output becomes row 2's embed, and so on.
+        if (layer == 0) {
+            return ivec4(embed_q, embed_q, embed_q, 15);
+        }
+        // Previous layer's residual-like blend at that layer's merge phase.
+        float prev_phase = float(layer - 1) * 0.35;
+        float t_prev = 0.5 - 0.5 * cos(u_time * 1.2 + prev_phase);
+        float q_r = run_mandelbrot(c, u_max_iter);
+        float k_r = run_julia(c, seed, u_max_iter);
+        float v_r = run_burning(c, u_max_iter);
+        float N_f = float(u_max_iter);
+        float qk_r = (q_r * k_r) / (N_f * N_f);
+        float a_r  = 1.0 / (1.0 + exp(-8.0 * (qk_r - 0.5)));
+        int prev_r = bright4(a_r * v_r, u_max_iter);
+        int prev_g = bright4(q_r,       u_max_iter);
+        int prev_b = bright4(k_r,       u_max_iter);
+        return ivec4(mix4(embed_q, prev_r, t_prev),
+                     mix4(embed_q, prev_g, t_prev),
+                     mix4(embed_q, prev_b, t_prev),
+                     15);
     }
     if (stage == 1) {
-        // Attn (LNS) — log-domain KQV·α.
+        // Attn (LNS) — log-domain KQV·α, bright linear mapping.
         float q = run_mandelbrot(c, u_max_iter);
         float k = run_julia(c, seed, u_max_iter);
         float v = run_burning(c, u_max_iter);
         float N = float(u_max_iter);
         float qk = (q * k) / (N * N);
         float a = 1.0 / (1.0 + exp(-8.0 * (qk - 0.5)));
-        return ivec4(quantize4(a * v, u_max_iter),
-                     quantize4(q, u_max_iter),
-                     quantize4(k, u_max_iter),
+        int r_a = bright4(a * v, u_max_iter);
+        int g_a = bright4(q,     u_max_iter);
+        int b_a = bright4(k,     u_max_iter);
+        // Merge: Mandelbrot embed (t=0) → KQV attention (t=1).
+        return ivec4(mix4(embed_q, r_a, t_merge),
+                     mix4(embed_q, g_a, t_merge),
+                     mix4(embed_q, b_a, t_merge),
                      int(clamp(floor(a * 15.0 + 0.5), 0.0, 15.0)));
     }
     if (stage == 2) {
-        // Attn (Linear) — saturating Q8 linear SBP₁₂.
+        // Attn (Linear) — saturating Q8 linear SBP₁₂, bright linear mapping.
         ivec2 c_lin = ivec2(lin_encode(re), lin_encode(im));
         ivec2 seed_lin = ivec2(lin_encode(pbf_decode(seed.x)),
                                lin_encode(pbf_decode(seed.y)));
@@ -769,13 +845,16 @@ ivec4 llm_cell(vec2 local_uv, int layer, int stage) {
         float N = float(u_max_iter);
         float qk = (q * k) / (N * N);
         float a = 1.0 / (1.0 + exp(-8.0 * (qk - 0.5)));
-        return ivec4(quantize4(a * v, u_max_iter),
-                     quantize4(q, u_max_iter),
-                     quantize4(k, u_max_iter),
+        int r_a = bright4(a * v, u_max_iter);
+        int g_a = bright4(q,     u_max_iter);
+        int b_a = bright4(k,     u_max_iter);
+        return ivec4(mix4(embed_q, r_a, t_merge),
+                     mix4(embed_q, g_a, t_merge),
+                     mix4(embed_q, b_a, t_merge),
                      int(clamp(floor(a * 15.0 + 0.5), 0.0, 15.0)));
     }
     if (stage == 3) {
-        // Attn (Polar) — phase hue + log magnitude.
+        // Attn (Polar) — phase hue + log magnitude; embed merge animates in.
         ivec2 z = c;
         int n;
         for (n = 0; n < 256; n++) {
@@ -789,16 +868,16 @@ ivec4 llm_cell(vec2 local_uv, int layer, int stage) {
         float hue = (phase / 6.2831853) + 0.5;
         float mag2 = pbf_decode(pbfc_abs2(z));
         float log_r = clamp(0.5 + 0.25 * log(max(mag2, 1e-30)), 0.0, 1.0);
-        return ivec4(int(clamp(floor(hue * 15.0 + 0.5), 0.0, 15.0)),
-                     int(clamp(floor(log_r * 15.0 + 0.5), 0.0, 15.0)),
-                     quantize4(smooth_iter(n, mag2, u_max_iter), u_max_iter),
+        int r_a = int(clamp(floor(hue * 15.0 + 0.5), 0.0, 15.0));
+        int g_a = int(clamp(floor(log_r * 15.0 + 0.5), 0.0, 15.0));
+        int b_a = quantize4(smooth_iter(n, mag2, u_max_iter), u_max_iter);
+        return ivec4(mix4(embed_q, r_a, t_merge),
+                     mix4(embed_q, g_a, t_merge),
+                     mix4(embed_q, b_a, t_merge),
                      15);
     }
     if (stage == 4) {
-        // Attn (Tapered) — PBF12's denormal taper: very-small |z| stays
-        // distinguishable in geometric levels instead of flushing to zero
-        // as IEEE subnormals would. The low nibble of the encoded
-        // magnitude code is the finest-grade gradient.
+        // Attn (Tapered) — PBF12's denormal taper; embed merge animates in.
         ivec2 z = c;
         int n;
         for (n = 0; n < 256; n++) {
@@ -807,9 +886,12 @@ ivec4 llm_cell(vec2 local_uv, int layer, int stage) {
             z = pbfc_sqr_add(z, c);
         }
         int mag_code = pbfc_abs2(z);
-        return ivec4((mag_code >> 0) & 0xF,    // finest grade
-                     (mag_code >> 4) & 0xF,    // coarse grade
-                     quantize4(smooth_iter(n, pbf_decode(mag_code), u_max_iter), u_max_iter),
+        int r_a = (mag_code >> 0) & 0xF;
+        int g_a = (mag_code >> 4) & 0xF;
+        int b_a = quantize4(smooth_iter(n, pbf_decode(mag_code), u_max_iter), u_max_iter);
+        return ivec4(mix4(embed_q, r_a, t_merge),
+                     mix4(embed_q, g_a, t_merge),
+                     mix4(embed_q, b_a, t_merge),
                      15);
     }
     if (stage == 5) {
@@ -838,25 +920,23 @@ ivec4 llm_cell(vec2 local_uv, int layer, int stage) {
                  int(clamp(floor(a * 15.0 + 0.5), 0.0, 15.0)));
 }
 
-// 7-layer × 7-stage LLM grid. Canvas partitions into a 7×7 tile layout
-// (7 columns of stages, 7 rows of layers, bottom-up). Each tile is a
-// self-contained fractal rendered in the arithmetic for that stage. A
-// 2-pixel grey border separates tiles so the grid is legible.
+// One-row LLM strip. Each canvas renders a single layer (specified by
+// u_layer) across 7 stage columns. The HTML stacks 7 such canvases to
+// compose the full 7-layer model.
 ivec4 sample_px(vec2 pix) {
-    vec2 tile_sz = u_res / vec2(7.0, 7.0);
-    int stage = int(clamp(floor(pix.x / tile_sz.x), 0.0, 6.0));          // column
-    int layer = int(clamp(floor((u_res.y - pix.y) / tile_sz.y), 0.0, 6.0)); // row, 0 = top
-    layer = 6 - layer;                                                    // flip so layer 0 at bottom
+    float tile_w = u_res.x / 7.0;
+    float tile_h = u_res.y;
+    int stage = int(clamp(floor(pix.x / tile_w), 0.0, 6.0));
+    int layer = u_layer;
 
-    // Tile-local pixel + 2-pixel separator.
-    vec2 local = vec2(mod(pix.x, tile_sz.x), mod(u_res.y - pix.y, tile_sz.y));
+    vec2 local = vec2(mod(pix.x, tile_w), u_res.y - pix.y);
     if (local.x < 2.0 || local.y < 2.0
-        || local.x > tile_sz.x - 2.0
-        || local.y > tile_sz.y - 2.0) {
-        return ivec4(4, 4, 4, 15);  // dim grey grid line
+        || local.x > tile_w - 2.0
+        || local.y > tile_h - 2.0) {
+        return ivec4(4, 4, 4, 15);  // dim grey separator between stages
     }
-    vec2 local_uv = (local / tile_sz - 0.5) * 2.0;
-    local_uv.x *= tile_sz.x / tile_sz.y;  // preserve tile aspect
+    vec2 local_uv = (vec2(local.x / tile_w, local.y / tile_h) - 0.5) * 2.0;
+    local_uv.x *= tile_w / tile_h;  // preserve tile aspect
     return llm_cell(local_uv, layer, stage);
 }
 
@@ -869,62 +949,78 @@ void main() {
     // 4-bit codes per channel are output as u8/255 so additive blend sums in
     // u8 integer space. The composite shader does the CF kdiv and e2m2 decode.
     ivec4 s = sample_px(gl_FragCoord.xy + u_jitter);
-    fragColor = vec4(s) / 255.0;
+    // 4-bit codes 0..15 → unit range. Previous `/ 255.0` divisor was for the
+    // old SSAA accumulator (sum of 16 × 15 → 240); single-pass renders need
+    // `/ 15.0` to reach full brightness at code=15.
+    vec4 col = vec4(s) / 15.0;
+    fragColor = vec4(col.rgb * u_brightness, col.a);
 }
 </script>
 
 <script>
-const canvas = document.getElementById('cv');
-const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true });
-if (!gl) {
-    document.body.innerHTML = '<div style="padding:40px;color:#f55;font:14px monospace">WebGL2 not available in this browser. Try Chrome 80+, Firefox 51+, or Safari 15+.</div>';
-    throw new Error('no webgl2');
-}
-
-function compileShader(type, src) {
-    const s = gl.createShader(type);
-    gl.shaderSource(s, src);
-    gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-        const log = gl.getShaderInfoLog(s);
-        const numbered = src.split('\n').map((l, i) => String(i+1).padStart(4) + ': ' + l).join('\n');
-        const pre = document.createElement('pre');
-        pre.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:#000;color:#0f0;font:10px monospace;padding:10px;overflow:auto;z-index:9999;white-space:pre;';
-        pre.textContent = `Shader compile failed\n--- log ---\n${log}\n--- source ---\n${numbered}`;
-        document.body.appendChild(pre);
-        throw new Error('shader compile failed');
-    }
-    return s;
-}
-
-function linkProgram(vsSrc, fsSrc) {
-    const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
-    const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
-    const p = gl.createProgram();
-    gl.attachShader(p, vs); gl.attachShader(p, fs);
-    gl.linkProgram(p);
-    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
-        document.body.innerHTML = '<div style="padding:40px;color:#f55">Link failed: ' + gl.getProgramInfoLog(p) + '</div>';
-        throw new Error('link failed');
-    }
-    return p;
-}
-
+// One WebGL2 context per row-canvas. Each context compiles the same shader
+// source but receives a different `u_layer` uniform so it renders a single
+// layer's 1×7 tile strip.
 const vsSrc = document.getElementById('vs').textContent;
-const prog  = linkProgram(vsSrc, document.getElementById('fs').textContent);
-const comp  = linkProgram(vsSrc, document.getElementById('fs_composite').textContent);
-gl.useProgram(prog);
+const fsSrc = document.getElementById('fs').textContent;
 
-const buf = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-function bindQuadAttrib(p) {
-    const a = gl.getAttribLocation(p, 'a_pos');
+function makeCtx(canvas, layerIdx) {
+    const gl = canvas.getContext('webgl2', { antialias: false });
+    if (!gl) throw new Error('WebGL2 unavailable on canvas ' + canvas.id);
+
+    const compile = (type, src) => {
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src); gl.compileShader(s);
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+            const log = gl.getShaderInfoLog(s);
+            const numbered = src.split('\n').map((l, i) => String(i+1).padStart(4)+': '+l).join('\n');
+            const pre = document.createElement('pre');
+            pre.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:#000;color:#0f0;font:10px monospace;padding:10px;overflow:auto;z-index:9999;white-space:pre;';
+            pre.textContent = `Shader compile failed (canvas ${canvas.id})\n--- log ---\n${log}\n--- source ---\n${numbered}`;
+            document.body.appendChild(pre);
+            throw new Error('shader compile failed');
+        }
+        return s;
+    };
+    const vs = compile(gl.VERTEX_SHADER, vsSrc);
+    const fs = compile(gl.FRAGMENT_SHADER, fsSrc);
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs); gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        throw new Error('link failed: ' + gl.getProgramInfoLog(prog));
+    }
+    gl.useProgram(prog);
+
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+    const a = gl.getAttribLocation(prog, 'a_pos');
     gl.enableVertexAttribArray(a);
     gl.vertexAttribPointer(a, 2, gl.FLOAT, false, 0, 0);
+
+    const u = {
+        res:          gl.getUniformLocation(prog, 'u_res'),
+        center:       gl.getUniformLocation(prog, 'u_center'),
+        scale:        gl.getUniformLocation(prog, 'u_scale'),
+        iter:         gl.getUniformLocation(prog, 'u_max_iter'),
+        mode:         gl.getUniformLocation(prog, 'u_compute_mode'),
+        demo:         gl.getUniformLocation(prog, 'u_demo'),
+        disp:         gl.getUniformLocation(prog, 'u_display'),
+        julia:        gl.getUniformLocation(prog, 'u_julia_seed'),
+        four:         gl.getUniformLocation(prog, 'u_pbf_four'),
+        ln_per_level: gl.getUniformLocation(prog, 'u_ln_per_level'),
+        step_q13:     gl.getUniformLocation(prog, 'u_step_q13'),
+        offset:       gl.getUniformLocation(prog, 'u_offset'),
+        jitter:       gl.getUniformLocation(prog, 'u_jitter'),
+        time:         gl.getUniformLocation(prog, 'u_time'),
+        layer:        gl.getUniformLocation(prog, 'u_layer'),
+        brightness:   gl.getUniformLocation(prog, 'u_brightness'),
+    };
+    return { canvas, gl, prog, u, layerIdx };
 }
-bindQuadAttrib(prog);
-bindQuadAttrib(comp);
+
+const ctxs = [0,1,2].map(i => makeCtx(document.getElementById('cv'+i), i));
 
 // ── Base-pluggable PBF12 ──────────────────────────────────────────────────
 // The fractal generation is identical across bases — same V_MIN/V_MAX, same
@@ -1015,55 +1111,6 @@ function pbf_encode(v, baseKey) {
     return v > 0 ? 2048 + level : 2047 - level;
 }
 
-const u = {
-    res:          gl.getUniformLocation(prog, 'u_res'),
-    center:       gl.getUniformLocation(prog, 'u_center'),
-    scale:        gl.getUniformLocation(prog, 'u_scale'),
-    iter:         gl.getUniformLocation(prog, 'u_max_iter'),
-    mode:         gl.getUniformLocation(prog, 'u_compute_mode'),
-    demo:         gl.getUniformLocation(prog, 'u_demo'),
-    disp:         gl.getUniformLocation(prog, 'u_display'),
-    julia:        gl.getUniformLocation(prog, 'u_julia_seed'),
-    four:         gl.getUniformLocation(prog, 'u_pbf_four'),
-    ln_per_level: gl.getUniformLocation(prog, 'u_ln_per_level'),
-    step_q13:     gl.getUniformLocation(prog, 'u_step_q13'),
-    offset:       gl.getUniformLocation(prog, 'u_offset'),
-    jitter:       gl.getUniformLocation(prog, 'u_jitter'),
-};
-const uc = {
-    accum:   gl.getUniformLocation(comp, 'u_accum'),
-    samples: gl.getUniformLocation(comp, 'u_samples'),
-};
-
-// 16-sample rotated-grid jitter pattern (in fractions of a pixel, centred on 0).
-const JITTERS = [
-    [-0.4375,  0.0625], [-0.3125,  0.3125], [-0.1875, -0.4375], [-0.0625, -0.1875],
-    [ 0.0625,  0.4375], [ 0.1875,  0.1875], [ 0.3125, -0.3125], [ 0.4375, -0.0625],
-    [-0.4375, -0.3125], [-0.3125, -0.0625], [-0.1875,  0.1875], [-0.0625,  0.4375],
-    [ 0.0625, -0.1875], [ 0.1875, -0.4375], [ 0.3125,  0.0625], [ 0.4375,  0.3125],
-];
-
-// RGBA8 framebuffer for additive sample accumulation. Sum of 16 × 4-bit codes
-// maxes at 240, fits in u8 per channel. Additive blending on u8 is exact.
-let accumTex = null, accumFbo = null, accumW = 0, accumH = 0;
-function ensureAccum(w, h) {
-    if (w === accumW && h === accumH && accumTex) return;
-    if (accumTex) gl.deleteTexture(accumTex);
-    if (accumFbo) gl.deleteFramebuffer(accumFbo);
-    accumTex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, accumTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    accumFbo = gl.createFramebuffer();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, accumFbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, accumTex, 0);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    accumW = w; accumH = h;
-}
-
 const state = {
     cx: -0.5, cy: 0, scale: 2.5,
     maxIter: 64,
@@ -1072,6 +1119,8 @@ const state = {
     disp: 0,           // 0 trio, 1 ceil, 2 phase, 3 cmp
     base: 'fine',
     juliaRe: -0.7269, juliaIm: 0.1889,
+    brightness: 1.0,
+    speed: 1.0,
 };
 
 const DISP_DESC = {
@@ -1081,70 +1130,55 @@ const DISP_DESC = {
     cmp:   '<span class="r">R</span> = iter (linear) &nbsp; <span class="g">G</span> = iter (gamma) &nbsp; <span class="b">B</span> = iter (squared). Toggle SBP↔SBP+CF to see where the CF correction shifts the boundary.',
 };
 
-// Progressive accumulation state. When any parameter changes, reset to 0 so
-// the next frame starts a fresh accumulation.
-let sampleIdx = 0;
-let rafPending = false;
+const animStart = performance.now();
 
-function renderOnePass() {
-    rafPending = false;
+// Render every canvas. Called each rAF tick for continuous animation.
+// `animAccum` carries the speed-scaled wall-clock time so changing the speed
+// slider doesn't jump the phase — the animation pauses/accelerates in place.
+let animAccum = 0;
+let lastTick = performance.now();
+
+function renderAll() {
+    const now = performance.now();
+    animAccum += (now - lastTick) * 0.001 * state.speed;
+    lastTick = now;
+
     const t0 = performance.now();
     const bc = baseConsts(state.base);
-    const W = canvas.width, H = canvas.height;
-    ensureAccum(W, H);
 
-    // ── Sample pass: one jittered sample, additively blended into the FBO.
-    gl.useProgram(prog);
-    gl.uniform2f(u.res, W, H);
-    gl.uniform2f(u.center, state.cx, state.cy);
-    gl.uniform1f(u.scale, state.scale);
-    gl.uniform1i(u.iter, state.maxIter);
-    gl.uniform1i(u.mode, state.mode);
-    gl.uniform1i(u.demo, state.demo);
-    gl.uniform1i(u.disp, state.disp);
-    gl.uniform1f(u.ln_per_level, bc.ln_per_level);
-    gl.uniform1i(u.step_q13, bc.step_q13);
-    gl.uniform1i(u.offset, bc.offset);
-    gl.uniform2i(u.julia, pbf_encode(state.juliaRe, state.base), pbf_encode(state.juliaIm, state.base));
-    gl.uniform1i(u.four, pbf_encode(4.0, state.base));
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, accumFbo);
-    gl.viewport(0, 0, W, H);
-    if (sampleIdx === 0) {
-        gl.clearColor(0, 0, 0, 0);
-        gl.clear(gl.COLOR_BUFFER_BIT);
+    for (const c of ctxs) {
+        const gl = c.gl, u = c.u;
+        gl.useProgram(c.prog);
+        gl.viewport(0, 0, c.canvas.width, c.canvas.height);
+        gl.uniform2f(u.res, c.canvas.width, c.canvas.height);
+        gl.uniform2f(u.center, state.cx, state.cy);
+        gl.uniform1f(u.scale, state.scale);
+        gl.uniform1i(u.iter, state.maxIter);
+        gl.uniform1i(u.mode, state.mode);
+        gl.uniform1i(u.demo, state.demo);
+        gl.uniform1i(u.disp, state.disp);
+        gl.uniform1f(u.time, animAccum);
+        gl.uniform1i(u.layer, c.layerIdx);
+        gl.uniform1f(u.brightness, state.brightness);
+        gl.uniform1f(u.ln_per_level, bc.ln_per_level);
+        gl.uniform1i(u.step_q13, bc.step_q13);
+        gl.uniform1i(u.offset, bc.offset);
+        gl.uniform2i(u.julia,
+            pbf_encode(state.juliaRe, state.base),
+            pbf_encode(state.juliaIm, state.base));
+        gl.uniform1i(u.four, pbf_encode(4.0, state.base));
+        gl.uniform2f(u.jitter, 0, 0);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.ONE, gl.ONE);
-    const j = JITTERS[sampleIdx];
-    gl.uniform2f(u.jitter, j[0], j[1]);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    gl.disable(gl.BLEND);
-    sampleIdx++;
-
-    // ── Composite: kdiv by however many samples are accumulated so far.
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, W, H);
-    gl.useProgram(comp);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, accumTex);
-    gl.uniform1i(uc.accum, 0);
-    gl.uniform1i(uc.samples, sampleIdx);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-
     const ms = (performance.now() - t0).toFixed(1);
-    document.getElementById('msStat').textContent = `${ms} ms · ${sampleIdx}/${JITTERS.length}× SSAA`;
-
-    if (sampleIdx < JITTERS.length) scheduleRender();
+    document.getElementById('msStat').textContent = `${ms} ms · 3 layers`;
 }
 
-function scheduleRender() {
-    if (rafPending) return;
-    rafPending = true;
-    requestAnimationFrame(renderOnePass);
-}
-// Any scene/view change restarts the accumulation from sample 0.
-function invalidate() { sampleIdx = 0; scheduleRender(); }
+function animLoop() { renderAll(); requestAnimationFrame(animLoop); }
+requestAnimationFrame(animLoop);
+
+// Back-compat shim for old invalidate() callers.
+function invalidate() { /* continuous animation means no explicit invalidate */ }
 
 // ── UI ─────────────────────────────────────────────────────────────────────
 
@@ -1201,7 +1235,18 @@ const iterEl = document.getElementById('iter');
 iterEl.oninput = () => {
     state.maxIter = parseInt(iterEl.value);
     document.getElementById('iterVal').textContent = state.maxIter;
-    invalidate();
+};
+
+const brightEl = document.getElementById('bright');
+brightEl.oninput = () => {
+    state.brightness = parseFloat(brightEl.value);
+    document.getElementById('brightVal').textContent = state.brightness.toFixed(2);
+};
+
+const speedEl = document.getElementById('speed');
+speedEl.oninput = () => {
+    state.speed = parseFloat(speedEl.value);
+    document.getElementById('speedVal').textContent = state.speed.toFixed(2);
 };
 
 const jre = document.getElementById('jre'), jim = document.getElementById('jim');
@@ -1218,37 +1263,40 @@ document.getElementById('reset').onclick = () => {
     invalidate();
 };
 
-// ── Mouse: drag to pan, wheel to zoom ──────────────────────────────────────
-let dragging = false, drag0 = null, dragC = null;
-canvas.addEventListener('mousedown', e => {
-    if (e.button !== 0) return;
-    dragging = true;
-    drag0 = { x: e.clientX, y: e.clientY };
-    dragC = { cx: state.cx, cy: state.cy };
-});
+// ── Mouse: pan / zoom — shared across all 7 row canvases ──────────────────
+let dragging = false, drag0 = null, dragC = null, dragRect = null;
+for (const c of ctxs) {
+    c.canvas.addEventListener('mousedown', e => {
+        if (e.button !== 0) return;
+        dragging = true;
+        drag0 = { x: e.clientX, y: e.clientY };
+        dragC = { cx: state.cx, cy: state.cy };
+        dragRect = c.canvas.getBoundingClientRect();
+    });
+    c.canvas.addEventListener('wheel', e => {
+        e.preventDefault();
+        const f = e.deltaY > 0 ? 1.25 : 1 / 1.25;
+        state.scale *= f;
+    }, { passive: false });
+}
 window.addEventListener('mouseup', () => { dragging = false; });
 window.addEventListener('mousemove', e => {
-    if (!dragging) return;
-    const rect = canvas.getBoundingClientRect();
-    state.cx = dragC.cx - (e.clientX - drag0.x) / rect.width  * state.scale;
-    state.cy = dragC.cy - (e.clientY - drag0.y) / rect.height * state.scale;
-    invalidate();
+    if (!dragging || !dragRect) return;
+    state.cx = dragC.cx - (e.clientX - drag0.x) / dragRect.width  * state.scale;
+    state.cy = dragC.cy - (e.clientY - drag0.y) / dragRect.height * state.scale;
 });
-canvas.addEventListener('wheel', e => {
-    e.preventDefault();
-    const f = e.deltaY > 0 ? 1.25 : 1/1.25;
-    state.scale *= f;
-    invalidate();
-}, { passive: false });
 
-// ── Boot ──────────────────────────────────────────────────────────────────
+// ── Boot: resize all canvases to fit the stack's column width ─────────────
 function resize() {
-    const wrap = canvas.parentElement;
-    const w = Math.min(wrap.clientWidth, 1200);
-    canvas.width = w;
-    canvas.height = w;
-    document.getElementById('resStat').textContent = `${w}×${w}`;
-    invalidate();
+    const wrap = document.querySelector('.layer-stack');
+    const w = Math.min(wrap.clientWidth, 1400);
+    const h = Math.max(120, Math.round(w / 7));
+    for (const c of ctxs) {
+        c.canvas.width = w;
+        c.canvas.height = h;
+    }
+    const rs = document.getElementById('resStat');
+    if (rs) rs.textContent = `${w}×${h} × 7`;
 }
 window.addEventListener('resize', resize);
 resize();
