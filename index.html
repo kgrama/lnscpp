@@ -1,0 +1,1291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PBF Fractal RGB · 4-bit per channel · GPU compute</title>
+<style>
+  :root { --bg:#0a0a0a; --panel:#141414; --text:#e8e8e8; --dim:#888; --accent:#e8ff3c; --border:#2a2a2a; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font:12px ui-monospace, monospace; }
+  header { padding:10px 16px; border-bottom:1px solid var(--border); display:flex; gap:24px; align-items:baseline; flex-wrap:wrap; }
+  header h1 { font-size:14px; letter-spacing:2px; color:var(--accent); }
+  header .meta { color:var(--dim); }
+  header .meta strong { color:var(--text); }
+  main { display:grid; grid-template-columns:1fr 280px; gap:12px; padding:12px; }
+  canvas { background:#000; image-rendering:auto; width:100%; height:auto; aspect-ratio:1/1; cursor:grab; }
+  canvas:active { cursor:grabbing; }
+  .panel { background:var(--panel); border:1px solid var(--border); padding:12px; margin-bottom:12px; }
+  .panel h2 { font-size:10px; letter-spacing:2px; color:var(--dim); margin-bottom:8px; text-transform:uppercase; }
+  .row { display:flex; gap:6px; margin-bottom:6px; }
+  .btn { flex:1; padding:6px 4px; background:transparent; border:1px solid var(--border); color:var(--dim); font:inherit; font-size:10px; cursor:pointer; text-transform:uppercase; letter-spacing:1px; }
+  .btn:hover { color:var(--accent); border-color:var(--accent); }
+  .btn.active { color:var(--accent); border-color:var(--accent); background:rgba(232,255,60,0.08); }
+  label { display:block; color:var(--dim); margin:8px 0 4px; font-size:10px; text-transform:uppercase; letter-spacing:1px; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  .stat { color:var(--dim); margin-top:4px; }
+  .stat strong { color:var(--text); }
+  .legend { font-size:10px; line-height:1.5; color:var(--dim); margin-top:6px; }
+  .legend .r { color:#f55; } .legend .g { color:#5f5; } .legend .b { color:#5af; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>PBF FRACTAL RGB · WEBGL2</h1>
+  <div class="meta">3 × <strong>PBF12</strong> compute lanes per pixel · <span id="bagde">SBP + CF (int Q13)</span> · CF is the AA · <span id="msStat">— ms</span></div>
+</header>
+
+<main>
+  <canvas id="cv" width="1200" height="1200"></canvas>
+  <div>
+    <div class="panel">
+      <h2>Demo</h2>
+      <div class="row">
+        <button class="btn"        data-demo="quant">Quant · 3×RGB</button>
+        <button class="btn active" data-demo="infer">Infer · 4×RGBA</button>
+      </div>
+      <div class="row">
+        <button class="btn" data-demo="p27">P27 · Newton</button>
+        <button class="btn" data-demo="p35">P35 · Overflow</button>
+      </div>
+      <div class="row">
+        <button class="btn" data-demo="p31">P31 · Polar</button>
+        <button class="btn" data-demo="p32">P32 · Taper</button>
+      </div>
+      <div class="legend">
+        <strong>Quant</strong> (3×RGB): three PBF12 fractals — Mandelbrot/Julia/Burning — quantised to 4 bits per channel, no attention layer.<br>
+        <strong>Infer</strong> (4×RGBA): KQV·A attention — Q=Mandelbrot, K=Julia, V=Burning, α=σ(Q·K)·V. One-token one-head inference.<br>
+        <strong>P27 Newton</strong>: z³−1 Newton iteration. IEEE rendering shows black NaN pockets at critical points; SBP log-domain division saturates gracefully — no black holes (P27 + P28).<br>
+        <strong>P35 Overflow</strong>: linear SBP<sub>12</sub> (signed Q<sub>8</sub>, ±8 range). Saturated 12-bit bits, sign-extended, are already a valid SBP<sub>24</sub> — width promotion is free.<br>
+        <strong>P31 Polar</strong>: Mandelbrot orbit rendered in polar form — R = phase hue (atan2 over SBP), G = log|z|, B = iter. Polar mul/div are position adds; only the `+c` step leaves polar. Shows phase-precision retention at deep zoom.<br>
+        <strong>P32 Taper</strong>: Mandelbrot shaded by |z_final| under SBP's denormal taper. Values below the normal range stay distinct (geometric spacing) instead of flushing to zero as in IEEE subnormals — R = low bits, G = high bits of the tapered magnitude.
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Display mode</h2>
+      <div class="row">
+        <button class="btn active" data-disp="trio">Trio</button>
+        <button class="btn"        data-disp="ceil">Ceilings</button>
+      </div>
+      <div class="row">
+        <button class="btn" data-disp="phase">Phase</button>
+        <button class="btn" data-disp="cmp">SBP vs CF</button>
+      </div>
+      <div id="dispDesc" class="legend"></div>
+    </div>
+
+    <div class="panel">
+      <h2>LNS base · 12-bit (E,M) split</h2>
+      <div class="row">
+        <button class="btn active" data-base="fine" title="raw flat encoding, no exponent split">1.007 (fine)</button>
+      </div>
+      <div class="row">
+        <button class="btn" data-base="conway"   title="Conway's look-and-say constant ≈ 1.3036">λ</button>
+        <button class="btn" data-base="plastic"  title="plastic number ≈ 1.3247">ρ</button>
+        <button class="btn" data-base="phi"      title="golden ratio ≈ 1.618">φ</button>
+      </div>
+      <div class="row">
+        <button class="btn" data-base="two"      title="binary, 2.0">2</button>
+        <button class="btn" data-base="silver"   title="silver ratio = 1+√2 ≈ 2.414">δs</button>
+        <button class="btn" data-base="khinchin" title="Khinchin's constant ≈ 2.685">K</button>
+        <button class="btn" data-base="e"        title="Euler's e ≈ 2.718">e</button>
+      </div>
+      <div class="row">
+        <button class="btn" data-base="pi"       title="π ≈ 3.142">π</button>
+        <button class="btn" data-base="bronze"   title="bronze ratio = (3+√13)/2 ≈ 3.303">δb</button>
+        <button class="btn" data-base="copper"   title="copper ratio = 2+√5 ≈ 4.236">δc</button>
+        <button class="btn" data-base="nickel"   title="nickel ratio = (5+√29)/2 ≈ 5.193">δn</button>
+      </div>
+      <div class="row">
+        <button class="btn" data-base="twopi"    title="2π ≈ 6.283">2π</button>
+        <button class="btn" data-base="pisq"     title="π² ≈ 9.870">π²</button>
+        <button class="btn" data-base="ten"      title="decimal, 10">10</button>
+      </div>
+      <div class="legend">
+        Each base sets per-LSB step = ln(base)/2^M, where M is the mantissa bits left after picking E = ⌈log₂(rings)⌉ rings to span [1e-3, 1e3]. Bases where log_b(10⁶) drops below a power-of-2 boundary (silver, e, π, bronze, copper, nickel, 2π, π², 10) save an exponent bit and reinvest it as mantissa. Hover for full names.
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Iter cap</h2>
+      <input type="range" id="iter" min="16" max="256" value="64" step="16">
+      <div class="stat">max iter: <strong id="iterVal">64</strong></div>
+    </div>
+
+    <div class="panel">
+      <h2>Julia seed (Trio.G channel)</h2>
+      <div class="row">
+        <input type="number" id="jre" value="-0.7269" step="0.001" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--accent);padding:4px;font:inherit;">
+        <input type="number" id="jim" value="0.1889"  step="0.001" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--accent);padding:4px;font:inherit;">
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>View</h2>
+      <button class="btn" id="reset" style="width:100%">RESET</button>
+      <div class="stat">drag = pan · wheel = zoom</div>
+      <div class="stat">res: <strong id="resStat">1200×1200</strong></div>
+    </div>
+  </div>
+</main>
+
+<script type="x-shader/x-vertex" id="vs">#version 300 es
+in vec2 a_pos;
+void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
+</script>
+
+<script type="x-shader/x-fragment" id="fs_composite">#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+uniform sampler2D u_accum;   // RGBA8 accumulator: per-channel sum of N sample codes, stored as u8/255
+uniform int       u_samples; // N
+out vec4 fragColor;
+
+// Kuttaka rounded integer division (same as CF shader).
+int kdiv(int a, int b) {
+    if (b == 0) return a;
+    int h = b / 2;
+    return (a + h) / b;
+}
+
+float e2m2_decode(int code) {
+    int e = (code >> 2) & 3;
+    int m = code & 3;
+    float v;
+    if (e == 0) v = float(m) * 0.25;
+    else        v = (1.0 + float(m) * 0.25) * exp2(float(e - 1));
+    return v / 7.0;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec4 acc = texelFetch(u_accum, p, 0);
+    // acc.rgba holds sum(code)/255 in [0, N*15/255] per lane. Recover the
+    // four int sums (all four CF lanes: M / J / BS / Tricorn).
+    ivec4 sum = ivec4(floor(acc * 255.0 + 0.5));
+    int r4 = kdiv(sum.x, u_samples);
+    int g4 = kdiv(sum.y, u_samples);
+    int b4 = kdiv(sum.z, u_samples);
+    int a4 = kdiv(sum.w, u_samples);
+    // Alpha lane (tricorn) modulates brightness of the RGB result so all
+    // four CF lanes visibly contribute to one pixel.
+    float alpha = e2m2_decode(a4);
+    fragColor = vec4(e2m2_decode(r4) * alpha,
+                     e2m2_decode(g4) * alpha,
+                     e2m2_decode(b4) * alpha, 1.0);
+}
+</script>
+
+<script type="x-shader/x-fragment" id="fs">#version 300 es
+precision highp float;
+precision highp int;
+
+out vec4 fragColor;
+
+uniform vec2 u_res;
+uniform vec2 u_center;
+uniform float u_scale;
+uniform int  u_max_iter;
+uniform int  u_compute_mode;   // 0 = SBP only, 1 = SBP + CF, 2 = Linear SBP
+uniform int  u_demo;           // 0 Quant3 · 1 Infer4 · 2 P27 Newton · 3 P35 Linear
+uniform int  u_display;        // 0 trio, 1 ceilings, 2 phase, 3 sbp-vs-cf
+uniform ivec2 u_julia_seed;    // pre-encoded seed
+uniform int  u_pbf_four;       // pre-encoded 4.0
+
+// ── PBF12 format ────────────────────────────────────────────────────────────
+// Bumped from PBF8 to reduce magnitude-quantization banding in the fractal.
+// ~10 effective bits at unity, 2047 magnitude levels per side.
+const int PBF_MID    = 2048;
+const int PBF_MAX    = 4095;
+const int PBF_LEVELS = 2047;
+const float V_MIN    = 1e-3;
+const float V_MAX    = 1e3;
+
+// Pluggable base — these are uniforms set per chosen base from JS.
+//   step_natural = ln(base)         per level (in natural log units)
+//   ln_per_level = step_natural     used by float encode/decode at boundary
+//   step_q13     = step_natural * Q used by the int Q13 sb/db CF
+//   offset       = round(ln(V_MIN) / step_natural)
+//
+// Bases supported: e (1.000), φ (0.481), π (1.145), 2 (0.693)
+uniform float u_ln_per_level;
+uniform int   u_step_q13;
+uniform int   u_offset;
+
+// ── Q13 continued-fraction primitives ───────────────────────────────────────
+const int PBF_Q   = 8192;       // 1 << 13
+const int PBF_LN2 = 5680;       // round(ln(2) * Q)
+
+int pbf_kdiv(int a, int b) {
+    if (b == 0) return a;
+    int hb = b / 2;
+    int n  = (b > 0) ? (a + hb) : (a - hb);
+    return n / b;
+}
+
+// Round-to-nearest a*b/c. |a*b| ≤ 16*Q² = 2^30 < 2^31 by construction.
+int pbf_muldiv(int a, int b, int c) {
+    if (c == 0) return a;
+    int prod  = a * b;
+    int chalf = (c > 0) ? (c / 2) : -((-c) / 2);
+    int n     = (c > 0) ? (prod + chalf) : (prod - chalf);
+    return n / c;
+}
+
+// ln(1 + x/Q) * Q via 8-term Gauss CF.
+//   ln(1+x) = x/(1 + 1²x/(2 + 1²x/(3 + 2²x/(4 + 2²x/(5 + 3²x/(6 + 3²x/(7 + 4²x/(8)))))))))
+// Coefficients are paired squares [1,1,4,4,9,9,16]; ~16 dB convergence per
+// term. Ramanujan CF (snums Rust) trades shape for ~35 dB/term but needs a
+// rational input transform — sticking with Gauss here.
+int pbf_ln1p_cf(int x) {
+    if (x == 0)        return 0;
+    if (x <= -PBF_Q)   return -PBF_Q * 100;
+    int h = 8 * PBF_Q;
+    h = 7 * PBF_Q + pbf_muldiv(16 * x, PBF_Q, h);
+    h = 6 * PBF_Q + pbf_muldiv( 9 * x, PBF_Q, h);
+    h = 5 * PBF_Q + pbf_muldiv( 9 * x, PBF_Q, h);
+    h = 4 * PBF_Q + pbf_muldiv( 4 * x, PBF_Q, h);
+    h = 3 * PBF_Q + pbf_muldiv( 4 * x, PBF_Q, h);
+    h = 2 * PBF_Q + pbf_muldiv(     x, PBF_Q, h);
+    h = 1 * PBF_Q + pbf_muldiv(     x, PBF_Q, h);
+    return pbf_muldiv(x, PBF_Q, h);
+}
+
+// (exp(x/Q) - 1) * Q via 7-term CF
+int pbf_expm1_cf(int x) {
+    if (x == 0) return 0;
+    if (x >  10 * PBF_Q) return PBF_Q * 16384;
+    if (x < -10 * PBF_Q) return -PBF_Q;
+    int h = 2 * PBF_Q;
+    h = 7 * PBF_Q + pbf_muldiv(-x, PBF_Q, h);
+    h = 2 * PBF_Q + pbf_muldiv( x, PBF_Q, h);
+    h = 5 * PBF_Q + pbf_muldiv(-x, PBF_Q, h);
+    h = 2 * PBF_Q + pbf_muldiv( x, PBF_Q, h);
+    h = 3 * PBF_Q + pbf_muldiv(-x, PBF_Q, h);
+    h = 2 * PBF_Q + pbf_muldiv( x, PBF_Q, h);
+    h = 1 * PBF_Q + pbf_muldiv(-x, PBF_Q, h);
+    return pbf_muldiv(x, PBF_Q, h);
+}
+
+int pbf_exp_cf(int x) {
+    if (x == 0) return PBF_Q;
+    int k = pbf_kdiv(x, PBF_LN2);
+    int r = x - k * PBF_LN2;
+    int er = PBF_Q + pbf_expm1_cf(r);
+    if (k >= 0) {
+        if (k >= 16) return PBF_Q * 16384;
+        return er << k;
+    }
+    int nk = -k;
+    if (nk >= 31) return 0;
+    return er >> nk;
+}
+
+// Fast polynomial softplus / softminus — no CF iterations.
+//
+// Softplus Taylor around d=0:  ln(1+e^d) ≈ ln2 + d/2 + d²/(8Q)
+//   the odd terms after d/2 vanish (generating function of Bernoulli).
+//   Good to ~4e-3 rel at |d| = Q; asymptotes exactly at |d| ≥ 5Q.
+//
+// Softminus is singular at d=0, so we use the same linear-delta pivot the
+// snums/sbp `log_add64` uses: `ln(1−e^d) = ln|d·ln2| + d/2 + d²·ln2/24`.
+// `ln|d|/Q` is recovered via CLZ-style doubling (normalize |d| into
+// `[Q/2, Q)`) plus one `ln1p` on the normalized residue — no
+// catastrophic `Q − exp(d)` cancellation anywhere.
+int pbf_softplus_cf(int d) {
+    if (d >  5 * PBF_Q) return d;
+    if (d < -5 * PBF_Q) return 0;
+    int lin = PBF_LN2 + (d / 2);
+    int quad = pbf_muldiv(d, d, 8 * PBF_Q);
+    return lin + quad;
+}
+
+int pbf_softminus_cf(int d) {
+    if (d >= 0)          return -100 * PBF_Q;
+    if (d < -5 * PBF_Q)  return 0;
+    int abs_d = -d;
+    int y = abs_d;
+    int k = 0;
+    for (int i = 0; i < 20; ++i) {
+        if (y >= PBF_Q / 2) break;
+        y *= 2; k++;
+    }
+    int log_abs_d = pbf_ln1p_cf(y - PBF_Q) - k * PBF_LN2;
+    const int LOG_LN2_Q13 = -3004;         // round(log(ln2) · Q)
+    int d2 = pbf_muldiv(d, d, 24 * PBF_Q);
+    int d2_ln2 = pbf_muldiv(d2, PBF_LN2, PBF_Q);
+    return log_abs_d + LOG_LN2_Q13 + (d / 2) + d2_ln2;
+}
+
+// ── PBF8 ALU ────────────────────────────────────────────────────────────────
+
+int pbf_neg(int a) {
+    if (a == 0 || a == PBF_MAX) return a;
+    return PBF_MAX - a;
+}
+
+int pbf_abs(int a) {
+    if (a == 0 || a >= PBF_MID) return a;
+    return PBF_MAX - a;
+}
+
+int pbf_encode(float v) {
+    if (v == 0.0) return 0;
+    float mag = abs(v);
+    if (mag < V_MIN) mag = V_MIN;
+    if (mag > V_MAX) mag = V_MAX;
+    int level = int(floor(log(mag / V_MIN) / u_ln_per_level + 0.5));
+    if (level < 0) level = 0;
+    if (level > PBF_LEVELS - 1) level = PBF_LEVELS - 1;
+    return (v > 0.0) ? (PBF_MID + level) : (PBF_MID - 1 - level);
+}
+
+// Float decode for the smooth-iter computation at the boundary (called once
+// per pixel after the iteration loop, NOT inside the loop).
+float pbf_decode(int code) {
+    if (code == 0)        return 0.0;
+    if (code == PBF_MAX)  return 1e30;
+    int sign  = (code >= PBF_MID) ? 1 : -1;
+    int level = (code >= PBF_MID) ? (code - PBF_MID) : (PBF_MID - 1 - code);
+    return float(sign) * V_MIN * exp(float(level) * u_ln_per_level);
+}
+
+int pbf_mul(int a, int b) {
+    if (a == 0 || b == 0) return 0;
+    if (a == PBF_MAX || b == PBF_MAX) return PBF_MAX;
+    int an = (a < PBF_MID) ? 1 : 0;
+    int bn = (b < PBF_MID) ? 1 : 0;
+    int am = (an == 1) ? (PBF_MID - 1 - a) : (a - PBF_MID);
+    int bm = (bn == 1) ? (PBF_MID - 1 - b) : (b - PBF_MID);
+    int cm = am + bm + u_offset;
+    if (cm < 0)            return 0;
+    if (cm >= PBF_LEVELS)  return PBF_MAX;
+    int cn = an ^ bn;
+    return (cn == 1) ? (PBF_MID - 1 - cm) : (PBF_MID + cm);
+}
+
+int pbf_add(int a, int b) {
+    if (a == 0) return b;
+    if (b == 0) return a;
+    if (a == PBF_MAX || b == PBF_MAX) return PBF_MAX;
+    int an = (a < PBF_MID) ? 1 : 0;
+    int bn = (b < PBF_MID) ? 1 : 0;
+    int am = (an == 1) ? (PBF_MID - 1 - a) : (a - PBF_MID);
+    int bm = (bn == 1) ? (PBF_MID - 1 - b) : (b - PBF_MID);
+
+    int hi, lo, cn;
+    if (an == bn) {
+        hi = (am > bm) ? am : bm;
+        lo = (am > bm) ? bm : am;
+        cn = an;
+    } else {
+        if (am == bm) return 0;
+        if (am > bm) { hi = am; lo = bm; cn = an; }
+        else         { hi = bm; lo = am; cn = bn; }
+    }
+
+    int cm;
+    if (u_compute_mode == 0) {
+        // SBP only: max-magnitude approximation, no CF correction
+        cm = hi;
+    } else {
+        // SBP + CF: hi + (sb or db) correction, all int Q13
+        int d_q13   = (lo - hi) * u_step_q13;        // <= 0
+        int corr_q13 = (an == bn) ? pbf_softplus_cf(d_q13)
+                                  : pbf_softminus_cf(d_q13);
+        int corr    = pbf_kdiv(corr_q13, u_step_q13);
+        cm          = hi + corr;
+        if (cm < 0)           cm = 0;
+        if (cm >= PBF_LEVELS) cm = PBF_LEVELS - 1;
+    }
+    return (cn == 1) ? (PBF_MID - 1 - cm) : (PBF_MID + cm);
+}
+
+int pbf_sub(int a, int b) { return pbf_add(a, pbf_neg(b)); }
+
+// Log-domain division: position subtract, base-offset corrected.
+// Illustrates P27 — no zero singularity. `b` encoded as the smallest
+// representable level doesn't collapse the quotient to NaN; it promotes
+// toward PBF_MAX (encoded ∞) with the same graceful taper the denormal
+// layout provides near zero. Newton-fractal rendering depends on this.
+int pbf_div(int a, int b) {
+    if (a == 0) return 0;
+    if (a == PBF_MAX) return PBF_MAX;
+    if (b == 0) return (a >= PBF_MID) ? PBF_MAX : (PBF_MAX - 1);
+    if (b == PBF_MAX) return 0;
+    int an = (a < PBF_MID) ? 1 : 0;
+    int bn = (b < PBF_MID) ? 1 : 0;
+    int am = (an == 1) ? (PBF_MID - 1 - a) : (a - PBF_MID);
+    int bm = (bn == 1) ? (PBF_MID - 1 - b) : (b - PBF_MID);
+    int cm = am - bm - u_offset;
+    if (cm < 0)           return 0;
+    if (cm >= PBF_LEVELS) return PBF_MAX;
+    int cn = an ^ bn;
+    return (cn == 1) ? (PBF_MID - 1 - cm) : (PBF_MID + cm);
+}
+
+// ── Linear SBP overlay (for u_compute_mode == 2) ────────────────────────────
+//
+// Signed fixed-point Q8 in a 12-bit field: 1 sign + 11 magnitude, Q = 2^8.
+// Range ±(2048/256) = ±8 at 8-bit precision (256 levels per unit). Narrow
+// on purpose — Mandelbrot / Julia iterates `z → z² + c` where `|z|` grows
+// past 2 before escape, so `|z|²` routinely overflows ±8 just as the orbit
+// is about to escape. When that happens the signed 12-bit add/mul saturates
+// to LIN_MAX / LIN_MIN.
+//
+// Overflow-legal: the saturated 12-bit code, sign-extended to 24 bits with
+// the SAME Q = 2^8, is already a valid SBP₂₄ encoding of the promoted value
+// (range ±32768). No re-encoding step — the bit pattern carries over. This
+// is the patent's "overflow promotes width" property: narrow compute stays
+// correct in wider context by mere bit-width extension. The lin_promote24
+// helper demonstrates this — the value is recovered verbatim in wider Q8.
+const int LIN_Q    = 256;        // 2^8
+const int LIN_MAX  = 2047;       // 12-bit signed positive bound
+const int LIN_MIN  = -2048;
+
+int lin_sat(int x) {
+    return clamp(x, LIN_MIN, LIN_MAX);
+}
+
+int lin_encode(float v) {
+    return lin_sat(int(round(v * float(LIN_Q))));
+}
+
+float lin_decode(int x) {
+    return float(x) / float(LIN_Q);
+}
+
+int lin_neg(int a) { return lin_sat(-a); }
+int lin_abs(int a) { return lin_sat(abs(a)); }
+int lin_add(int a, int b) { return lin_sat(a + b); }
+int lin_sub(int a, int b) { return lin_sat(a - b); }
+int lin_mul(int a, int b) { return lin_sat(pbf_muldiv(a, b, LIN_Q)); }
+
+// Demonstrates `overflow-legal`: the 12-bit SBP₁₂ code, sign-extended and
+// kept at the same Q, is already a valid SBP₂₄. The full-precision linear
+// multiplication (no saturation) matches lin_mul whenever lin_mul didn't
+// clip — otherwise it gives the wider value that SBP₂₄ can represent.
+int lin_mul_promoted24(int a, int b) { return pbf_muldiv(a, b, LIN_Q); }
+
+// Complex helpers for the linear overlay.
+ivec2 linc_sqr_add(ivec2 z, ivec2 c) {
+    int r2 = lin_mul(z.x, z.x);
+    int i2 = lin_mul(z.y, z.y);
+    int ri = lin_mul(z.x, z.y);
+    return ivec2(lin_add(lin_sub(r2, i2), c.x),
+                 lin_add(lin_add(ri, ri), c.y));
+}
+int linc_abs2(ivec2 z) {
+    // Promoted 24-bit product guarantees the escape test survives the Q8
+    // saturation on z — overflowing re²+im² would itself be a legal SBP₂₄.
+    int r2 = lin_mul_promoted24(z.x, z.x);
+    int i2 = lin_mul_promoted24(z.y, z.y);
+    return r2 + i2;
+}
+
+// The four linear-SBP fractal runners are defined below, after `smooth_iter`.
+
+// ── Complex helpers (ivec2 = (re, im)) ──────────────────────────────────────
+
+ivec2 pbfc_sqr(ivec2 z) {
+    int r2 = pbf_mul(z.x, z.x);
+    int i2 = pbf_mul(z.y, z.y);
+    int ri = pbf_mul(z.x, z.y);
+    return ivec2(pbf_sub(r2, i2), pbf_add(ri, ri));
+}
+
+ivec2 pbfc_sqr_add(ivec2 z, ivec2 c) {
+    ivec2 z2 = pbfc_sqr(z);
+    return ivec2(pbf_add(z2.x, c.x), pbf_add(z2.y, c.y));
+}
+
+int pbfc_abs2(ivec2 z) {
+    return pbf_add(pbf_mul(z.x, z.x), pbf_mul(z.y, z.y));
+}
+
+ivec2 pbfc_mul(ivec2 z, ivec2 w) {
+    // (z.x + i z.y)(w.x + i w.y) = (zx·wx − zy·wy) + i (zx·wy + zy·wx)
+    int rr = pbf_mul(z.x, w.x);
+    int ii = pbf_mul(z.y, w.y);
+    int ri = pbf_mul(z.x, w.y);
+    int ir = pbf_mul(z.y, w.x);
+    return ivec2(pbf_sub(rr, ii), pbf_add(ri, ir));
+}
+
+ivec2 pbfc_sub(ivec2 z, ivec2 w) {
+    return ivec2(pbf_sub(z.x, w.x), pbf_sub(z.y, w.y));
+}
+
+// Complex divide. z / w = z · conj(w) / |w|². The |w|² denominator is the
+// site of the Newton-fractal "zero singularity" — at critical points
+// f'(z) = 0 so |w|² → 0 and the IEEE path emits NaN. Under SBP, the
+// smallest representable |w|² yields a well-defined (saturated) quotient
+// that keeps the iteration alive; the visual consequence is that no black
+// holes form at critical points, which is the observable signature of P27
+// (NoZeroSingularity) + P28 (PureNoSingularity).
+ivec2 pbfc_div(ivec2 z, ivec2 w) {
+    int denom = pbfc_abs2(w);
+    int num_r = pbf_add(pbf_mul(z.x, w.x), pbf_mul(z.y, w.y));
+    int num_i = pbf_sub(pbf_mul(z.y, w.x), pbf_mul(z.x, w.y));
+    return ivec2(pbf_div(num_r, denom), pbf_div(num_i, denom));
+}
+
+// ── Fractal kernels ─────────────────────────────────────────────────────────
+// Each returns continuous escape time via the smooth-iter trick:
+//   smooth = n + 1 − log₂(log₂(|z|²)/2)
+// The float log/log call happens ONCE at the boundary after the loop exits,
+// not inside the loop. The smooth value drives gradient palettes instead of
+// stair-step plateaus.
+
+float smooth_iter(int n, float mag2, int max_iter) {
+    if (n >= max_iter) return float(max_iter);
+    if (mag2 <= 1.0001) return float(n);
+    return float(n) + 1.0 - log2(log2(mag2) * 0.5);
+}
+
+float run_mandelbrot(ivec2 c, int max_iter) {
+    ivec2 z = c;
+    int n;
+    for (n = 0; n < 256; n++) {
+        if (n >= max_iter) break;
+        if (pbfc_abs2(z) > u_pbf_four) break;
+        z = pbfc_sqr_add(z, c);
+    }
+    float mag2 = pbf_decode(pbfc_abs2(z));
+    return smooth_iter(n, mag2, max_iter);
+}
+
+float run_julia(ivec2 z0, ivec2 seed, int max_iter) {
+    ivec2 z = z0;
+    int n;
+    for (n = 0; n < 256; n++) {
+        if (n >= max_iter) break;
+        if (pbfc_abs2(z) > u_pbf_four) break;
+        z = pbfc_sqr_add(z, seed);
+    }
+    float mag2 = pbf_decode(pbfc_abs2(z));
+    return smooth_iter(n, mag2, max_iter);
+}
+
+float run_burning(ivec2 c, int max_iter) {
+    ivec2 z = c;
+    int n;
+    for (n = 0; n < 256; n++) {
+        if (n >= max_iter) break;
+        if (pbfc_abs2(z) > u_pbf_four) break;
+        z = ivec2(pbf_abs(z.x), pbf_abs(z.y));
+        z = pbfc_sqr_add(z, c);
+    }
+    float mag2 = pbf_decode(pbfc_abs2(z));
+    return smooth_iter(n, mag2, max_iter);
+}
+
+// 4th CF lane: Tricorn / Mandelbar — conjugate Mandelbrot, z_{n+1} = z̄_n² + c.
+// Same CF arithmetic primitive as Mandelbrot with a single negate on z.im
+// before the square. Routed to the alpha channel in RGBA mode.
+float run_tricorn(ivec2 c, int max_iter) {
+    ivec2 z = c;
+    int n;
+    for (n = 0; n < 256; n++) {
+        if (n >= max_iter) break;
+        if (pbfc_abs2(z) > u_pbf_four) break;
+        z = ivec2(z.x, pbf_neg(z.y));
+        z = pbfc_sqr_add(z, c);
+    }
+    float mag2 = pbf_decode(pbfc_abs2(z));
+    return smooth_iter(n, mag2, max_iter);
+}
+
+// Newton fractal for f(z) = z³ − 1. Iterates z ← z − f(z)/f'(z) with
+// division-by-near-zero happening at every critical point z = 0. Under
+// IEEE this collapses to NaN / infinity pockets that render as black
+// holes; under SBP (P27 + P28) the log-domain quotient promotes toward
+// the format's saturated-infinity encoding while remaining a LEGAL SBP
+// value — the next iteration just continues. The rendered output has
+// no black-hole artifacts at the critical points.
+//
+// Returns packed info in a float: integer part = iterations to converge,
+// fractional part = which root (0/3, 1/3, 2/3) attracted the iterate.
+float run_newton(ivec2 c, int max_iter) {
+    ivec2 z = c;
+    ivec2 one     = ivec2(pbf_encode(1.0), 0);
+    ivec2 three_z = ivec2(pbf_encode(3.0), 0);
+    int tol2 = pbf_encode(1e-3);  // |f(z)|² convergence tolerance
+    int n;
+    for (n = 0; n < 256; n++) {
+        if (n >= max_iter) break;
+        ivec2 z2 = pbfc_sqr(z);
+        ivec2 z3 = pbfc_mul(z2, z);
+        ivec2 fz = pbfc_sub(z3, one);                       // z³ − 1
+        if (pbfc_abs2(fz) < tol2) break;                    // converged
+        ivec2 fpz = ivec2(pbf_mul(three_z.x, z2.x),
+                          pbf_mul(three_z.x, z2.y));        // 3·z²
+        z = pbfc_sub(z, pbfc_div(fz, fpz));
+    }
+    // Classify root: roots of z³−1 at angles {0, 2π/3, 4π/3}.
+    float re = pbf_decode(z.x);
+    float im = pbf_decode(z.y);
+    // Which of the three cube roots of 1 is z closest to? Angle in [-π, π];
+    // root index = round(3·angle / (2π)) mod 3.
+    float ang = atan(im, re);
+    float root_idx = mod(floor(ang * (3.0 / 6.2831853) + 0.5 + 3.0), 3.0);
+    // Pack: integer = iter, fractional ∈ {0, 1/3, 2/3}.
+    float iter_frac = float(n) / float(max_iter);
+    return iter_frac + root_idx * (1.0 / 3.0) * 0.01;
+    // (The 0.01 factor keeps the root-tag small so downstream quantize4
+    // primarily reflects iter-to-converge; the hue shift per root is added
+    // by the display mapping in sample_px.)
+}
+
+// ── Linear-SBP fractal runners ──────────────────────────────────────────────
+// Match the four log-domain runners but use saturating Q8 integer ops. The
+// escape test reads `linc_abs2` in the *promoted-24* form (non-saturated)
+// so overflow of the 12-bit `z` is still a valid escape signal — the bits
+// widen to SBP₂₄ with no re-encoding.
+float run_mandelbrot_lin(ivec2 c, int max_iter) {
+    int four_lin = 4 * LIN_Q;
+    ivec2 z = c;
+    int n;
+    for (n = 0; n < 256; n++) {
+        if (n >= max_iter) break;
+        if (linc_abs2(z) > four_lin) break;
+        z = linc_sqr_add(z, c);
+    }
+    float mag2 = float(linc_abs2(z)) / float(LIN_Q);
+    return smooth_iter(n, mag2, max_iter);
+}
+float run_julia_lin(ivec2 z0, ivec2 seed, int max_iter) {
+    int four_lin = 4 * LIN_Q;
+    ivec2 z = z0;
+    int n;
+    for (n = 0; n < 256; n++) {
+        if (n >= max_iter) break;
+        if (linc_abs2(z) > four_lin) break;
+        z = linc_sqr_add(z, seed);
+    }
+    float mag2 = float(linc_abs2(z)) / float(LIN_Q);
+    return smooth_iter(n, mag2, max_iter);
+}
+float run_burning_lin(ivec2 c, int max_iter) {
+    int four_lin = 4 * LIN_Q;
+    ivec2 z = c;
+    int n;
+    for (n = 0; n < 256; n++) {
+        if (n >= max_iter) break;
+        if (linc_abs2(z) > four_lin) break;
+        z = ivec2(lin_abs(z.x), lin_abs(z.y));
+        z = linc_sqr_add(z, c);
+    }
+    float mag2 = float(linc_abs2(z)) / float(LIN_Q);
+    return smooth_iter(n, mag2, max_iter);
+}
+float run_tricorn_lin(ivec2 c, int max_iter) {
+    int four_lin = 4 * LIN_Q;
+    ivec2 z = c;
+    int n;
+    for (n = 0; n < 256; n++) {
+        if (n >= max_iter) break;
+        if (linc_abs2(z) > four_lin) break;
+        z = ivec2(z.x, lin_neg(z.y));
+        z = linc_sqr_add(z, c);
+    }
+    float mag2 = float(linc_abs2(z)) / float(LIN_Q);
+    return smooth_iter(n, mag2, max_iter);
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+
+// 4-bit quantisation of a continuous escape value with e2m2 (2-exp, 2-mant)
+// geometric spacing: the 16 codes decode to non-uniform levels, finer near 0
+// and coarser near 1. Low-intensity fractal bands get smaller block area.
+int quantize4(float s, int max_iter) {
+    if (s >= float(max_iter)) return 0;
+    float t = s * 0.25;                   // one cycle every 4 iter
+    float u = t - floor(t);               // u ∈ [0, 1)
+    // Map u through a log curve so equal u-intervals land in geometric buckets.
+    // 16 levels: code = floor(log2(1 + 15*u) / log2(16) * 16), clamped.
+    float code = floor(log2(1.0 + 15.0 * u) * 4.0);
+    return int(clamp(code, 0.0, 15.0));
+}
+
+// e2m2 decode: 4-bit code → [0, 1] with 2-exp, 2-mant geometric spacing.
+// bias=1: subnormals {0, .25, .5, .75}, normals up to (1+3/4)*2^2 = 7.0,
+// then divide by 7.0 for [0,1].
+float e2m2_decode(int code) {
+    int e = (code >> 2) & 3;
+    int m = code & 3;
+    float v;
+    if (e == 0) v = float(m) * 0.25;
+    else        v = (1.0 + float(m) * 0.25) * exp2(float(e - 1));
+    return v / 7.0;
+}
+
+// Per-sample compute: returns the four 4-bit codes (0..15) per lane for one
+// (sub)pixel. In trio mode (u_display == 0) the four lanes are the four
+// independent CF fractals Mandelbrot / Julia / Burning Ship / Tricorn —
+// structurally analogous to the Q / K / V / O projections of one attention
+// head running on the same input coordinate.
+ivec4 sample_px(vec2 pix) {
+    vec2 uv = (pix / u_res - 0.5) * vec2(u_res.x / u_res.y, 1.0);
+    float re = u_center.x + uv.x * u_scale;
+    float im = u_center.y + uv.y * u_scale;
+    ivec2 c  = ivec2(pbf_encode(re), pbf_encode(im));
+
+    int r4, g4, b4, a4;
+
+    // ── Demo dispatch ─────────────────────────────────────────────────────
+    // u_demo: 0 Quant3 · 1 Infer4 · 2 P27 Newton · 3 P35 Linear
+    if (u_demo == 0) {
+        // Quant 4-bit RGB, 3 fractals, no attention layer.
+        float q = run_mandelbrot(c, u_max_iter);
+        float k = run_julia(c, u_julia_seed, u_max_iter);
+        float v = run_burning(c, u_max_iter);
+        r4 = quantize4(q, u_max_iter);
+        g4 = quantize4(k, u_max_iter);
+        b4 = quantize4(v, u_max_iter);
+        a4 = 15;
+        return ivec4(r4, g4, b4, a4);
+    }
+    if (u_demo == 2) {
+        // P27 Newton — z³ − 1 iteration via SBP log-domain complex div.
+        // Pack: R = iter count, G = root-0 proximity, B = root-1 proximity,
+        // A = root-2 proximity (all quantise4-coded).
+        float packed = run_newton(c, u_max_iter);
+        float iter_frac = floor(packed * 100.0) / 100.0;
+        float root_tag  = (packed - iter_frac) * 100.0 * 3.0;  // 0,1,2
+        int root = int(round(root_tag));
+        r4 = quantize4(iter_frac * float(u_max_iter), u_max_iter);
+        g4 = (root == 0) ? 15 : 0;
+        b4 = (root == 1) ? 15 : 0;
+        a4 = (root == 2) ? 15 : 3;  // alpha tags root-2, always ≥ 3 so never fully transparent
+        return ivec4(r4, g4, b4, a4);
+    }
+    if (u_demo == 3 || u_compute_mode == 2) {
+        // P35 Linear SBP path — saturating Q8 integer ops. The four lanes
+        // project Q / K / V / Tricorn in linear SBP₁₂. Saturation regions
+        // visualise where the 12-bit magnitude is actually a legal SBP₂₄.
+        ivec2 c_lin    = ivec2(lin_encode(re), lin_encode(im));
+        ivec2 seed_lin = ivec2(lin_encode(pbf_decode(u_julia_seed.x)),
+                               lin_encode(pbf_decode(u_julia_seed.y)));
+        float q = run_mandelbrot_lin(c_lin, u_max_iter);
+        float k = run_julia_lin(c_lin, seed_lin, u_max_iter);
+        float v = run_burning_lin(c_lin, u_max_iter);
+        float tc = run_tricorn_lin(c_lin, u_max_iter);
+        float N = float(u_max_iter);
+        float qk = (q * k) / (N * N);
+        float a = 1.0 / (1.0 + exp(-8.0 * (qk - 0.5)));
+        float av = a * v;
+        r4 = quantize4(av, u_max_iter);
+        g4 = quantize4(q,  u_max_iter);
+        b4 = quantize4(k,  u_max_iter);
+        a4 = quantize4(tc, u_max_iter);
+        return ivec4(r4, g4, b4, a4);
+    }
+    if (u_demo == 4) {
+        // P31 Polar — run Mandelbrot, render final z in polar coords.
+        // R = phase hue (atan2 over SBP-decoded reals; phase ∈ [-π, π] maps
+        //     to 4-bit bucket via mod-1 wrap),
+        // G = log|z| magnitude (polar's native coordinate — position add
+        //     under polar overlay),
+        // B = iter-to-escape (smooth),
+        // A = fully opaque.
+        ivec2 z = c;
+        int n;
+        for (n = 0; n < 256; n++) {
+            if (n >= u_max_iter) break;
+            if (pbfc_abs2(z) > u_pbf_four) break;
+            z = pbfc_sqr_add(z, c);
+        }
+        float re_f = pbf_decode(z.x);
+        float im_f = pbf_decode(z.y);
+        float phase = atan(im_f, re_f);                    // [-π, π]
+        float hue_u = (phase / 6.2831853) + 0.5;           // [0, 1)
+        float mag2_f = pbf_decode(pbfc_abs2(z));
+        float log_r  = clamp(0.5 + 0.25 * log(max(mag2_f, 1e-30)), 0.0, 1.0);
+        float iter_s = smooth_iter(n, mag2_f, u_max_iter);
+        r4 = int(clamp(floor(hue_u  * 15.0 + 0.5), 0.0, 15.0));
+        g4 = int(clamp(floor(log_r  * 15.0 + 0.5), 0.0, 15.0));
+        b4 = quantize4(iter_s, u_max_iter);
+        a4 = 15;
+        return ivec4(r4, g4, b4, a4);
+    }
+    if (u_demo == 5) {
+        // P32 Taper — run Mandelbrot, render with fine-grained magnitude
+        // shading that keeps subnormal-range values distinct. The PBF12
+        // format's denormal taper means small |z| still encodes into
+        // separable levels (geometric spacing toward zero) rather than
+        // flushing to a single "zero" bucket as IEEE subnormals would.
+        ivec2 z = c;
+        int n;
+        for (n = 0; n < 256; n++) {
+            if (n >= u_max_iter) break;
+            if (pbfc_abs2(z) > u_pbf_four) break;
+            z = pbfc_sqr_add(z, c);
+        }
+        // Read the encoded magnitude directly — bypasses pbf_decode so the
+        // 11-bit geometric level (including denormals at the low end) is
+        // what drives the shading.
+        int mag_code = pbfc_abs2(z);
+        // Split into low-bits / high-bits for R/G so fine denormal
+        // gradations stay visible; B carries the escape iter.
+        r4 = (mag_code >> 0) & 0xF;     // bottom nibble = finest grade
+        g4 = (mag_code >> 4) & 0xF;     // next nibble  = coarse grade
+        b4 = quantize4(smooth_iter(n, pbf_decode(mag_code), u_max_iter), u_max_iter);
+        a4 = 15;
+        return ivec4(r4, g4, b4, a4);
+    }
+    // u_demo == 1 (Infer 4×RGBA attention) — falls through to the legacy
+    // KQV·A path gated on u_display for trio/ceiling/phase/cmp sub-modes.
+
+    if (u_display == 0) {
+        // KQV·A: each pixel simulates one-token / one-head attention where
+        //   Q = Mandelbrot escape time (query score)
+        //   K = Julia escape time     (key score)
+        //   V = Burning-Ship escape   (value)
+        //   A = σ(8 · (Q·K / N² − 0.5))  — attention weight in [0, 1]
+        //   out = A · V
+        // R shows A·V (attention-weighted output), G shows Q, B shows K,
+        // alpha shows A. Zooming reveals where attention concentrates —
+        // the "active" regions of the KQ agreement landscape.
+        float q = run_mandelbrot(c, u_max_iter);
+        float k = run_julia(c, u_julia_seed, u_max_iter);
+        float v = run_burning(c, u_max_iter);
+        float N  = float(u_max_iter);
+        float qk = (q * k) / (N * N);
+        float a  = 1.0 / (1.0 + exp(-8.0 * (qk - 0.5)));
+        float av = a * v;
+        r4 = quantize4(av, u_max_iter);
+        g4 = quantize4(q,  u_max_iter);
+        b4 = quantize4(k,  u_max_iter);
+        a4 = int(clamp(floor(a * 15.0 + 0.5), 0.0, 15.0));
+    } else if (u_display == 1) {
+        r4 = quantize4(run_mandelbrot(c, u_max_iter / 4), u_max_iter / 4);
+        g4 = quantize4(run_mandelbrot(c, u_max_iter / 2), u_max_iter / 2);
+        b4 = quantize4(run_mandelbrot(c, u_max_iter),     u_max_iter);
+        a4 = 15; // opaque in ceiling mode
+    } else if (u_display == 2) {
+        ivec2 z = c;
+        int n = u_max_iter;
+        for (int i = 0; i < 256; i++) {
+            if (i >= u_max_iter) break;
+            if (pbfc_abs2(z) > u_pbf_four) { n = i; break; }
+            z = pbfc_sqr_add(z, c);
+        }
+        float re_f = pbf_decode(z.x);
+        float im_f = pbf_decode(z.y);
+        float re_n = clamp(0.5 + 0.25 * re_f, 0.0, 1.0);
+        float im_n = clamp(0.5 + 0.25 * im_f, 0.0, 1.0);
+        r4 = int(floor(re_n * 15.0 + 0.5));
+        g4 = int(floor(im_n * 15.0 + 0.5));
+        float mag2 = pbf_decode(pbfc_abs2(z));
+        b4 = quantize4(smooth_iter(n, mag2, u_max_iter), u_max_iter);
+        a4 = 15;
+    } else {
+        float s = run_mandelbrot(c, u_max_iter);
+        int q = quantize4(s, u_max_iter);
+        r4 = q;
+        g4 = (q * 13) / 15;
+        b4 = (q * q) / 15;
+        a4 = 15;
+    }
+
+    return ivec4(r4, g4, b4, a4);
+}
+
+uniform vec2 u_jitter;     // subpixel offset for this pass (fraction of a pixel)
+
+void main() {
+    // Single-sample per pass. JS drives N passes with different jitters and
+    // additive blending into an RGBA8 framebuffer. This is the "more parallel"
+    // path: each pass is an independent GPU dispatch across all pixels. The
+    // 4-bit codes per channel are output as u8/255 so additive blend sums in
+    // u8 integer space. The composite shader does the CF kdiv and e2m2 decode.
+    ivec4 s = sample_px(gl_FragCoord.xy + u_jitter);
+    fragColor = vec4(s) / 255.0;
+}
+</script>
+
+<script>
+const canvas = document.getElementById('cv');
+const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true });
+if (!gl) {
+    document.body.innerHTML = '<div style="padding:40px;color:#f55;font:14px monospace">WebGL2 not available in this browser. Try Chrome 80+, Firefox 51+, or Safari 15+.</div>';
+    throw new Error('no webgl2');
+}
+
+function compileShader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        const log = gl.getShaderInfoLog(s);
+        const numbered = src.split('\n').map((l, i) => String(i+1).padStart(4) + ': ' + l).join('\n');
+        const pre = document.createElement('pre');
+        pre.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:#000;color:#0f0;font:10px monospace;padding:10px;overflow:auto;z-index:9999;white-space:pre;';
+        pre.textContent = `Shader compile failed\n--- log ---\n${log}\n--- source ---\n${numbered}`;
+        document.body.appendChild(pre);
+        throw new Error('shader compile failed');
+    }
+    return s;
+}
+
+function linkProgram(vsSrc, fsSrc) {
+    const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+    const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+    const p = gl.createProgram();
+    gl.attachShader(p, vs); gl.attachShader(p, fs);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+        document.body.innerHTML = '<div style="padding:40px;color:#f55">Link failed: ' + gl.getProgramInfoLog(p) + '</div>';
+        throw new Error('link failed');
+    }
+    return p;
+}
+
+const vsSrc = document.getElementById('vs').textContent;
+const prog  = linkProgram(vsSrc, document.getElementById('fs').textContent);
+const comp  = linkProgram(vsSrc, document.getElementById('fs_composite').textContent);
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+function bindQuadAttrib(p) {
+    const a = gl.getAttribLocation(p, 'a_pos');
+    gl.enableVertexAttribArray(a);
+    gl.vertexAttribPointer(a, 2, gl.FLOAT, false, 0, 0);
+}
+bindQuadAttrib(prog);
+bindQuadAttrib(comp);
+
+// ── Base-pluggable PBF12 ──────────────────────────────────────────────────
+// The fractal generation is identical across bases — same V_MIN/V_MAX, same
+// Mandelbrot/Julia/Burning math. Only the SPACING between encoded values
+// changes per base. Standard (fine) uses all 2046 levels; named bases use
+// only the few levels that fit a per-level ratio of `base` in [V_MIN, V_MAX].
+//
+// per-level ratio = base
+//   standard fine: 1.00677  (each level ≈ 0.7% larger — smooth fractal)
+//   φ            : 1.618    (~14 levels in range — chunky)
+//   2            : 2.0      (~10 levels — very chunky)
+//   e            : 2.718    (~7 levels  — very chunky)
+//   π            : 3.14     (~6 levels  — very chunky)
+// Each base sets the encoding's per-LSB step to ln(base) / 2^M, where M is
+// the mantissa-bit count after picking E = ceil(log2(ceil(log_base(range))))
+// rings to cover [V_MIN, V_MAX]. For a 12-bit format covering [1e-3, 1e3]:
+//
+//   base     E (exp)  M (mantissa)   per-LSB ratio    per-LSB %
+//   2          5         6           2^(1/64)          1.090%
+//   φ          5         6           φ^(1/64)          0.755%
+//   e          4         7           e^(1/128)         0.790%
+//   π          4         7           π^(1/128)         0.898%
+//   fine       —         —           e^FINE_LN         0.677% (raw flat)
+//
+// Bases > 2 (e, π) save an exponent bit and reinvest it as mantissa precision
+// in the same total bit width. φ uses same E as 2 but its smaller per-ring
+// step gives finer per-LSB.
+const FINE_LN = Math.log(1e3 / 1e-3) / 2046;        // ≈ 0.006752
+const VMIN_F  = 1e-3;
+const VMAX_F  = 1e3;
+const LN_VMIN = Math.log(VMIN_F);
+
+function makeBase(label, base) {
+    if (base === null) {
+        // Fine path — flat 11-bit encoding, no exp/mantissa split
+        return {
+            label, ln_per_level: FINE_LN, e_bits: 11, m_bits: 0,
+            lsb_pct: ((Math.exp(FINE_LN) - 1) * 100).toFixed(3),
+        };
+    }
+    const ln_b   = Math.log(base);
+    const rings  = Math.ceil(Math.log(VMAX_F / VMIN_F) / ln_b);
+    const e_bits = Math.max(1, Math.ceil(Math.log2(rings)));
+    const m_bits = 11 - e_bits;
+    const mantissa_positions = 1 << m_bits;
+    const ln_per_level = ln_b / mantissa_positions;
+    const lsb_pct = ((Math.exp(ln_per_level) - 1) * 100).toFixed(3);
+    return { label, ln_per_level, e_bits, m_bits, lsb_pct };
+}
+const BASES = {
+    fine:     makeBase('1.007 (fine)', null),
+    // Small-base family
+    conway:   makeBase('λ',  1.3035772),               // Conway's look-and-say constant
+    plastic:  makeBase('ρ',  1.3247180),               // plastic number (cubic φ analog)
+    phi:      makeBase('φ',  (1 + Math.sqrt(5)) / 2),  // golden, 1st metallic
+    // Mid-range
+    two:      makeBase('2',  2),
+    silver:   makeBase('δs', 1 + Math.sqrt(2)),        // 2nd metallic ≈ 2.414
+    khinchin: makeBase('K',  2.6854520),               // Khinchin's constant
+    e:        makeBase('e',  Math.E),
+    // Around π
+    pi:       makeBase('π',  Math.PI),
+    bronze:   makeBase('δb', (3 + Math.sqrt(13)) / 2), // 3rd metallic ≈ 3.303
+    copper:   makeBase('δc', 2 + Math.sqrt(5)),        // 4th metallic ≈ 4.236
+    nickel:   makeBase('δn', (5 + Math.sqrt(29)) / 2), // 5th metallic ≈ 5.193
+    // Large
+    twopi:    makeBase('2π', 2 * Math.PI),
+    pisq:     makeBase('π²', Math.PI * Math.PI),
+    ten:      makeBase('10', 10),
+};
+for (const k in BASES) {
+    BASES[k].step_q13 = Math.max(1, Math.round(BASES[k].ln_per_level * 8192));
+    BASES[k].offset   = Math.round(LN_VMIN / BASES[k].ln_per_level);
+}
+
+function baseConsts(baseKey) {
+    return BASES[baseKey];
+}
+
+function pbf_encode(v, baseKey) {
+    if (v === 0) return 0;
+    const ln_per_level = BASES[baseKey].ln_per_level;
+    let mag = Math.abs(v);
+    if (mag < VMIN_F) mag = VMIN_F;
+    let level = Math.round(Math.log(mag / VMIN_F) / ln_per_level);
+    if (level < 0) level = 0;
+    if (level > 2046) level = 2046;
+    return v > 0 ? 2048 + level : 2047 - level;
+}
+
+const u = {
+    res:          gl.getUniformLocation(prog, 'u_res'),
+    center:       gl.getUniformLocation(prog, 'u_center'),
+    scale:        gl.getUniformLocation(prog, 'u_scale'),
+    iter:         gl.getUniformLocation(prog, 'u_max_iter'),
+    mode:         gl.getUniformLocation(prog, 'u_compute_mode'),
+    demo:         gl.getUniformLocation(prog, 'u_demo'),
+    disp:         gl.getUniformLocation(prog, 'u_display'),
+    julia:        gl.getUniformLocation(prog, 'u_julia_seed'),
+    four:         gl.getUniformLocation(prog, 'u_pbf_four'),
+    ln_per_level: gl.getUniformLocation(prog, 'u_ln_per_level'),
+    step_q13:     gl.getUniformLocation(prog, 'u_step_q13'),
+    offset:       gl.getUniformLocation(prog, 'u_offset'),
+    jitter:       gl.getUniformLocation(prog, 'u_jitter'),
+};
+const uc = {
+    accum:   gl.getUniformLocation(comp, 'u_accum'),
+    samples: gl.getUniformLocation(comp, 'u_samples'),
+};
+
+// 16-sample rotated-grid jitter pattern (in fractions of a pixel, centred on 0).
+const JITTERS = [
+    [-0.4375,  0.0625], [-0.3125,  0.3125], [-0.1875, -0.4375], [-0.0625, -0.1875],
+    [ 0.0625,  0.4375], [ 0.1875,  0.1875], [ 0.3125, -0.3125], [ 0.4375, -0.0625],
+    [-0.4375, -0.3125], [-0.3125, -0.0625], [-0.1875,  0.1875], [-0.0625,  0.4375],
+    [ 0.0625, -0.1875], [ 0.1875, -0.4375], [ 0.3125,  0.0625], [ 0.4375,  0.3125],
+];
+
+// RGBA8 framebuffer for additive sample accumulation. Sum of 16 × 4-bit codes
+// maxes at 240, fits in u8 per channel. Additive blending on u8 is exact.
+let accumTex = null, accumFbo = null, accumW = 0, accumH = 0;
+function ensureAccum(w, h) {
+    if (w === accumW && h === accumH && accumTex) return;
+    if (accumTex) gl.deleteTexture(accumTex);
+    if (accumFbo) gl.deleteFramebuffer(accumFbo);
+    accumTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, accumTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    accumFbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, accumFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, accumTex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    accumW = w; accumH = h;
+}
+
+const state = {
+    cx: -0.5, cy: 0, scale: 2.5,
+    maxIter: 64,
+    mode: 1,           // 0 = SBP, 1 = SBP + CF, 2 = linear SBP
+    demo: 1,           // 0 quant · 1 infer · 2 p27 newton · 3 p35 linear
+    disp: 0,           // 0 trio, 1 ceil, 2 phase, 3 cmp
+    base: 'fine',
+    juliaRe: -0.7269, juliaIm: 0.1889,
+};
+
+const DISP_DESC = {
+    trio:  'KQV·A inference proxy: <span class="r">R</span> = A·V (attention-weighted output) &nbsp; <span class="g">G</span> = Q (Mandelbrot) &nbsp; <span class="b">B</span> = K (Julia) &nbsp; alpha = A (softmax of Q·K). Each pixel is one-token, one-head attention on a 4-lane CF ALU.',
+    ceil:  '<span class="r">R</span> = iter cap/4 &nbsp; <span class="g">G</span> = iter cap/2 &nbsp; <span class="b">B</span> = full iter cap. Same Mandelbrot at three depths — gradient halo around the set.',
+    phase: '<span class="r">R</span> = re(z<sub>final</sub>) &nbsp; <span class="g">G</span> = im(z<sub>final</sub>) &nbsp; <span class="b">B</span> = iter count. Phase-coloured Mandelbrot.',
+    cmp:   '<span class="r">R</span> = iter (linear) &nbsp; <span class="g">G</span> = iter (gamma) &nbsp; <span class="b">B</span> = iter (squared). Toggle SBP↔SBP+CF to see where the CF correction shifts the boundary.',
+};
+
+// Progressive accumulation state. When any parameter changes, reset to 0 so
+// the next frame starts a fresh accumulation.
+let sampleIdx = 0;
+let rafPending = false;
+
+function renderOnePass() {
+    rafPending = false;
+    const t0 = performance.now();
+    const bc = baseConsts(state.base);
+    const W = canvas.width, H = canvas.height;
+    ensureAccum(W, H);
+
+    // ── Sample pass: one jittered sample, additively blended into the FBO.
+    gl.useProgram(prog);
+    gl.uniform2f(u.res, W, H);
+    gl.uniform2f(u.center, state.cx, state.cy);
+    gl.uniform1f(u.scale, state.scale);
+    gl.uniform1i(u.iter, state.maxIter);
+    gl.uniform1i(u.mode, state.mode);
+    gl.uniform1i(u.demo, state.demo);
+    gl.uniform1i(u.disp, state.disp);
+    gl.uniform1f(u.ln_per_level, bc.ln_per_level);
+    gl.uniform1i(u.step_q13, bc.step_q13);
+    gl.uniform1i(u.offset, bc.offset);
+    gl.uniform2i(u.julia, pbf_encode(state.juliaRe, state.base), pbf_encode(state.juliaIm, state.base));
+    gl.uniform1i(u.four, pbf_encode(4.0, state.base));
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, accumFbo);
+    gl.viewport(0, 0, W, H);
+    if (sampleIdx === 0) {
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    const j = JITTERS[sampleIdx];
+    gl.uniform2f(u.jitter, j[0], j[1]);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.disable(gl.BLEND);
+    sampleIdx++;
+
+    // ── Composite: kdiv by however many samples are accumulated so far.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, W, H);
+    gl.useProgram(comp);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, accumTex);
+    gl.uniform1i(uc.accum, 0);
+    gl.uniform1i(uc.samples, sampleIdx);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    const ms = (performance.now() - t0).toFixed(1);
+    document.getElementById('msStat').textContent = `${ms} ms · ${sampleIdx}/${JITTERS.length}× SSAA`;
+
+    if (sampleIdx < JITTERS.length) scheduleRender();
+}
+
+function scheduleRender() {
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(renderOnePass);
+}
+// Any scene/view change restarts the accumulation from sample 0.
+function invalidate() { sampleIdx = 0; scheduleRender(); }
+
+// ── UI ─────────────────────────────────────────────────────────────────────
+
+document.querySelectorAll('[data-demo]').forEach(b => {
+    b.onclick = () => {
+        const d = b.dataset.demo;
+        // demo enum: 0 quant · 1 infer · 2 p27 · 3 p35
+        state.demo = { quant: 0, infer: 1, p27: 2, p35: 3, p31: 4, p32: 5 }[d];
+        // compute_mode follows demo: p35 uses linear, rest use log+CF.
+        state.mode = d === 'p35' ? 2 : 1;
+        document.querySelectorAll('[data-demo]').forEach(x => x.classList.toggle('active', x === b));
+        const badge = {
+            quant: '4-bit Quant · 3 fractals',
+            infer: '4-bit Infer · 4 fractals + attention',
+            p27:   'P27 · Newton (no zero singularity)',
+            p35:   'P35 · Linear SBP (overflow-legal)',
+            p31:   'P31 · Polar (phase + log|z|)',
+            p32:   'P32 · Taper (denormal grade)',
+        };
+        document.getElementById('bagde').textContent = badge[d];
+        invalidate();
+    };
+});
+
+document.querySelectorAll('[data-disp]').forEach(b => {
+    b.onclick = () => {
+        state.disp = { trio: 0, ceil: 1, phase: 2, cmp: 3 }[b.dataset.disp];
+        document.querySelectorAll('[data-disp]').forEach(x => x.classList.toggle('active', x === b));
+        document.getElementById('dispDesc').innerHTML = DISP_DESC[b.dataset.disp];
+        invalidate();
+    };
+});
+document.getElementById('dispDesc').innerHTML = DISP_DESC.trio;
+
+function updateBaseBadge() {
+    const bc = BASES[state.base];
+    document.getElementById('bagde').textContent =
+        `SBP + CF · base ${bc.label}` +
+        ` · IEEE-equiv (1, ${bc.e_bits}, ${bc.m_bits})` +
+        ` · ${bc.lsb_pct}% per LSB`;
+}
+
+document.querySelectorAll('[data-base]').forEach(b => {
+    b.onclick = () => {
+        state.base = b.dataset.base;
+        document.querySelectorAll('[data-base]').forEach(x => x.classList.toggle('active', x === b));
+        updateBaseBadge();
+        invalidate();
+    };
+});
+updateBaseBadge();
+
+const iterEl = document.getElementById('iter');
+iterEl.oninput = () => {
+    state.maxIter = parseInt(iterEl.value);
+    document.getElementById('iterVal').textContent = state.maxIter;
+    invalidate();
+};
+
+const jre = document.getElementById('jre'), jim = document.getElementById('jim');
+const updateJulia = () => {
+    state.juliaRe = parseFloat(jre.value) || 0;
+    state.juliaIm = parseFloat(jim.value) || 0;
+    invalidate();
+};
+jre.onchange = updateJulia;
+jim.onchange = updateJulia;
+
+document.getElementById('reset').onclick = () => {
+    state.cx = -0.5; state.cy = 0; state.scale = 2.5;
+    invalidate();
+};
+
+// ── Mouse: drag to pan, wheel to zoom ──────────────────────────────────────
+let dragging = false, drag0 = null, dragC = null;
+canvas.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;
+    dragging = true;
+    drag0 = { x: e.clientX, y: e.clientY };
+    dragC = { cx: state.cx, cy: state.cy };
+});
+window.addEventListener('mouseup', () => { dragging = false; });
+window.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const rect = canvas.getBoundingClientRect();
+    state.cx = dragC.cx - (e.clientX - drag0.x) / rect.width  * state.scale;
+    state.cy = dragC.cy - (e.clientY - drag0.y) / rect.height * state.scale;
+    invalidate();
+});
+canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const f = e.deltaY > 0 ? 1.25 : 1/1.25;
+    state.scale *= f;
+    invalidate();
+}, { passive: false });
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+function resize() {
+    const wrap = canvas.parentElement;
+    const w = Math.min(wrap.clientWidth, 1200);
+    canvas.width = w;
+    canvas.height = w;
+    document.getElementById('resStat').textContent = `${w}×${w}`;
+    invalidate();
+}
+window.addEventListener('resize', resize);
+resize();
+</script>
+</body>
+</html>
